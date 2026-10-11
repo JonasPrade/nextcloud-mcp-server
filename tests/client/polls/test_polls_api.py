@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-from nextcloud_mcp_server.client.polls import PollsClient
+from nextcloud_mcp_server.client.polls import PollsClient, iso_duration
 from nextcloud_mcp_server.models.polls import (
     Poll,
     PollOption,
@@ -341,10 +341,22 @@ def test_tally_keeps_options_without_votes():
             "poll",
         ),
         (
-            lambda c: c.add_option(7, SLOT_SUMMER, 3600),
+            lambda c: c.add_option(7, "2026-10-23T18:00:00+02:00", "PT2H"),
             "POST",
             "/poll/7/option",
-            {"option": {"timestamp": SLOT_SUMMER, "duration": 3600}},
+            {
+                "option": {
+                    "isoTimestamp": "2026-10-23T18:00:00+02:00",
+                    "isoDuration": "PT2H",
+                }
+            },
+            "option",
+        ),
+        (
+            lambda c: c.add_option(7, "2026-10-23T18:00:00+02:00", None),
+            "POST",
+            "/poll/7/option",
+            {"option": {"isoTimestamp": "2026-10-23T18:00:00+02:00"}},
             "option",
         ),
         (
@@ -420,3 +432,29 @@ async def test_invalid_option_id_never_reaches_the_wire(mocker, bad_id):
         await client.vote(bad_id, "yes")
 
     mock_make_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("seconds", "use_days", "expected"),
+    [
+        (0, True, None),
+        (60, True, "PT1M"),
+        (5400, True, "PT1H30M"),
+        (7200, True, "PT2H"),
+        (5401, True, "PT1H30M1S"),
+        (86400, True, "P1D"),
+        (93600, True, "P1DT2H"),
+        (2 * 86400, True, "P2D"),
+        (86400, False, "PT24H"),
+        (49 * 3600, False, "PT49H"),
+        (93600, False, "PT26H"),
+    ],
+)
+def test_iso_duration(seconds, use_days, expected):
+    """Only canonical ISO 8601 durations go out; Polls answers others with 500."""
+    assert iso_duration(seconds, use_days=use_days) == expected
+
+
+def test_iso_duration_rejects_negative():
+    with pytest.raises(ValueError, match="negative"):
+        iso_duration(-1)

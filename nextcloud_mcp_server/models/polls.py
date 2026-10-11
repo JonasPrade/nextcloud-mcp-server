@@ -149,7 +149,8 @@ class PollConfiguration(BaseModel):
         description="Voting deadline in the poll's timezone; null if none is set",
     )
     timezone_name: str | None = Field(
-        default=None, description="IANA timezone the poll was created in"
+        default=None,
+        description="IANA timezone of the poll; date options are shown in it",
     )
     max_votes_per_option: int = Field(
         default=0, description="Maximum 'yes' votes per option; 0 = unlimited"
@@ -474,6 +475,13 @@ class AddPollOptionsResponse(BaseResponse):
         description="Timezone the option start/end times are expressed in"
     )
     added: list[PollOption] = Field(description="The options that were added")
+    note: str | None = Field(
+        default=None,
+        description=(
+            "Why nothing was added although the call succeeded, e.g. because "
+            "the slot already exists as an option"
+        ),
+    )
     url: str | None = _url_field()
 
 

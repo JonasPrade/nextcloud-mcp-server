@@ -158,6 +158,9 @@ async def test_mcp_polls_write_round_trip(
         poll_id = created["poll"]["id"]
         assert created["poll"]["configuration"]["title"] == title
         assert created["poll"]["configuration"]["allow_maybe"] is True
+        # Polls 9.3 stores the voting variant as timezoneName on POST; the
+        # tool's follow-up update must have replaced it.
+        assert created["poll"]["configuration"]["timezone_name"] == "Europe/Berlin"
 
         # Verify via the direct client, not only through the tool that made it.
         direct = await nc_client.polls.get_poll(poll_id)
@@ -190,6 +193,23 @@ async def test_mcp_polls_write_round_trip(
         assert by_id[first_id]["timestamp"] == SLOT_A
         assert by_id[first_id]["duration"] == 5400
         assert by_id[second_id]["duration"] == 3600
+        # Sent as isoTimestamp/isoDuration in the poll's zone, Polls keeps the
+        # local offset in the text, as its web UI does (not UTC).
+        assert by_id[first_id]["text"].startswith("2030-03-04T11:00:00+01:00")
+
+        # The same slot again: Polls hands back the existing option.
+        duplicate = _payload(
+            await nc_mcp_client.call_tool(
+                "nc_polls_add_date_option",
+                {
+                    "poll_id": poll_id,
+                    "start": "2030-03-04T11:00",
+                    "duration_minutes": 90,
+                },
+            )
+        )
+        assert duplicate["added"] == []
+        assert str(first_id) in duplicate["note"]
 
         for option_id, answer in ((first_id, "maybe"), (second_id, "yes")):
             voted = _payload(

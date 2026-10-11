@@ -38,6 +38,37 @@ def _validate_poll_id(poll_id: int) -> None:
     _validate_id(poll_id, "Poll")
 
 
+def iso_duration(seconds: int, *, use_days: bool = True) -> str | None:
+    """A length in seconds as an ISO 8601 duration, ``None`` for zero.
+
+    Polls parses ``isoDuration`` with PHP's ``DateInterval`` and answers a
+    malformed one with HTTP 500, so only the canonical
+    ``P[nD][T[nH][nM][nS]]`` form is produced: 5400 → ``PT1H30M``, 7200 →
+    ``PT2H``, 93600 → ``P1DT2H``. Zero yields ``None`` because Polls stores a
+    slot without duration as a point in time.
+
+    ``use_days=False`` keeps whole days as hours (86400 → ``PT24H``). Polls adds
+    a ``D`` part in the fixed offset of the start, not in the poll's zone, so a
+    span across a DST switch must be sent in hours to come out right.
+
+    Raises:
+        ValueError: if ``seconds`` is negative.
+    """
+    if seconds < 0:
+        raise ValueError(f"duration must not be negative: {seconds}")
+    if seconds == 0:
+        return None
+    days, rest = divmod(seconds, 86400) if use_days else (0, seconds)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    time_part = "".join(
+        f"{value}{unit}"
+        for value, unit in ((hours, "H"), (minutes, "M"), (secs, "S"))
+        if value
+    )
+    return "P" + (f"{days}D" if days else "") + (f"T{time_part}" if time_part else "")
+
+
 class PollsClient(BaseNextcloudClient):
     """Client for Nextcloud Polls app operations."""
 
@@ -80,8 +111,8 @@ class PollsClient(BaseNextcloudClient):
         trips.
 
         Raises:
-            HTTPStatusError: 404 if the poll does not exist or is not
-                accessible to the user.
+            HTTPStatusError: 400 ("Poll not found") if the poll does not
+                exist or is not accessible to the user.
         """
         _validate_poll_id(poll_id)
         return await self._ocs(f"/poll/{poll_id}")
@@ -137,14 +168,25 @@ class PollsClient(BaseNextcloudClient):
         return data["poll"]
 
     async def add_option(
-        self, poll_id: int, timestamp: int, duration: int
+        self, poll_id: int, iso_timestamp: str, iso_duration: str | None = None
     ) -> dict[str, Any]:
-        """Add a date option (Unix start + duration in seconds) and return it."""
+        """Add a date option and return it.
+
+        ``iso_timestamp`` is the start as ISO 8601 with offset, ``iso_duration``
+        its length as an ISO 8601 duration (``None`` for a point in time).
+        Polls keeps the offset of ``isoTimestamp`` in the option text, as its
+        web UI does. A Unix ``timestamp`` is never sent: Polls prefers it over
+        ``isoTimestamp`` and then writes the text in UTC.
+
+        An option with the same start and duration as an existing one is not
+        created again; Polls answers 201 with the existing option.
+        """
         _validate_poll_id(poll_id)
+        option: dict[str, Any] = {"isoTimestamp": iso_timestamp}
+        if iso_duration is not None:
+            option["isoDuration"] = iso_duration
         data = await self._ocs(
-            f"/poll/{poll_id}/option",
-            "POST",
-            json={"option": {"timestamp": timestamp, "duration": duration}},
+            f"/poll/{poll_id}/option", "POST", json={"option": option}
         )
         return data["option"]
 
@@ -195,13 +237,20 @@ class PollsClient(BaseNextcloudClient):
         return data["comment"]
 
     async def close_poll(self, poll_id: int) -> dict[str, Any]:
-        """Close a poll for voting and return it."""
+        """Close a poll for voting and return it.
+
+        Polls closes a poll by setting ``expire`` to the moment of closing.
+        """
         _validate_poll_id(poll_id)
         data = await self._ocs(f"/poll/{poll_id}/close", "PUT")
         return data["poll"]
 
     async def reopen_poll(self, poll_id: int) -> dict[str, Any]:
-        """Reopen a closed poll and return it."""
+        """Reopen a closed poll and return it.
+
+        Polls sets ``expire`` to 0 on reopening: the poll has no deadline
+        afterwards, the earlier one is gone.
+        """
         _validate_poll_id(poll_id)
         data = await self._ocs(f"/poll/{poll_id}/reopen", "PUT")
         return data["poll"]
