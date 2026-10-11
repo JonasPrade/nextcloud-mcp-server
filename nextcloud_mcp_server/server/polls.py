@@ -5,15 +5,19 @@ voting, commenting, confirming an option and closing or reopening a poll need
 ``polls.write``. Deleting, archiving and sharing are deliberately not exposed:
 the first two cannot be undone from here, and sharing notifies third parties.
 
-Polls answers a missing poll with 404 and a forbidden action with 403, so the
-translation to ``MCPError`` lives in one context manager rather than a
-try/except per tool. Every response carries a ``url`` that opens the poll.
+Polls is inconsistent about failures: a missing poll is a 400 "Poll not
+found" on ``/poll/{id}`` but a 404 carrying the text of the failed SQL query on
+the sub-routes (options, comments, votes, close, ...), and a refused action is a
+400 whose message starts with "denied" rather than a 403. The translation to
+``MCPError`` therefore goes by status *and* message, and lives in one context
+manager rather than a try/except per tool. Every response carries a ``url``
+that opens the poll.
 """
 
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -25,6 +29,7 @@ from mcp.types import ToolAnnotations
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.client import NextcloudClient
 from nextcloud_mcp_server.client.ocs import parse_ocs_envelope
+from nextcloud_mcp_server.client.polls import iso_duration
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.links import with_links
 from nextcloud_mcp_server.models.polls import (
@@ -61,20 +66,52 @@ logger = logging.getLogger(__name__)
 #: message rather than posting a wall of text into a shared poll.
 _COMMENT_MAX_LENGTH = 4000
 
+#: Server messages longer than this are cut before they reach the model.
+_SERVER_MESSAGE_MAX_LENGTH = 200
+
 
 def _server_message(response: Response) -> str | None:
-    """The reason Polls gave for a failed request, if it gave one."""
+    """The reason Polls gave for a failed request, if it is worth passing on.
+
+    Polls answers a lookup of a missing poll or option on most routes with
+    Doctrine's "Did expect one result but found none when executing: query
+    ..." -- several hundred characters of SQL that tell the model nothing the
+    status does not. Such messages are dropped; any other is cut to
+    ``_SERVER_MESSAGE_MAX_LENGTH`` characters.
+    """
     try:
         payload = response.json()
     except ValueError:
         return None
     envelope = parse_ocs_envelope(payload)
+    message: str | None = None
     # "Unknown error" is parse_ocs_envelope's stand-in for "no message sent".
     if envelope.message != "Unknown error":
-        return envelope.message
-    if isinstance(payload, dict) and isinstance(payload.get("message"), str):
-        return payload["message"]
-    return None
+        message = envelope.message
+    elif isinstance(payload, dict) and isinstance(payload.get("message"), str):
+        message = payload["message"]
+    if not message:
+        return None
+    if message.startswith("Did expect one result") or "query" in message:
+        return None
+    if len(message) > _SERVER_MESSAGE_MAX_LENGTH:
+        message = message[: _SERVER_MESSAGE_MAX_LENGTH - 1] + "…"
+    return message
+
+
+def _http_failure(status: int, reason: str | None) -> str:
+    """Classify a failed Polls request by status and message."""
+    lowered = (reason or "").lower()
+    if status == 404 or "not found" in lowered:
+        return "not found, or not shared with you"
+    if status == 403 or lowered.startswith("denied"):
+        return (
+            "not allowed — you may lack access or the right to change this "
+            "poll, or the poll is closed or locked"
+        )
+    if 400 <= status < 500:
+        return f"request rejected ({status})"
+    return f"server error ({status})"
 
 
 @contextmanager
@@ -87,23 +124,16 @@ def _polls_errors(action: str) -> Iterator[None]:
     except RequestError as e:
         raise MCPError(code=-1, message=f"Network error {action}: {e}")
     except HTTPStatusError as e:
-        status = e.response.status_code
-        if status == 404:
-            detail = "not found, or not shared with you"
-        elif status == 403:
-            detail = (
-                "not allowed — you may lack access or the right to change this "
-                "poll, or the poll is closed or locked"
-            )
-        else:
-            detail = f"server error ({status})"
         reason = _server_message(e.response)
+        detail = _http_failure(e.response.status_code, reason)
         if reason:
             detail = f"{detail} ({reason})"
         raise MCPError(code=-1, message=f"Failed {action}: {detail}")
 
 
 def _validate_timezone(name: str) -> None:
+    # Polls stores any string as timezoneName ("Mars/Olympus" included), so
+    # this check is the only one a zone name gets.
     try:
         ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as e:
@@ -132,6 +162,41 @@ async def _poll_with_options(
             listed if listed is not None else await client.polls.get_votes(poll_id)
         )
     return details["poll"], options, vote_list
+
+
+def _is_iana_zone(name: Any) -> bool:
+    if not isinstance(name, str) or not name:
+        return False
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return False
+    return True
+
+
+def _date_slot(
+    start: str, end: str | None, tz: ZoneInfo | timezone
+) -> tuple[datetime, int]:
+    """Begin and length in seconds of an all-day slot from ``start`` to ``end``.
+
+    Both are dates (YYYY-MM-DD), ``end`` inclusive. The slot runs from midnight
+    of ``start`` to midnight after ``end`` in ``tz``, so it is 23 or 25 hours
+    long on a day with a DST switch.
+    """
+    try:
+        first = date.fromisoformat(start)
+        last = date.fromisoformat(end) if end is not None else first
+    except ValueError as e:
+        raise ValueError(
+            "with all_day, start and end must be dates such as 2026-10-30"
+        ) from e
+    if last < first:
+        raise ValueError("the slot ends before it starts")
+    begin = datetime.combine(first, time(0), tzinfo=tz)
+    after = datetime.combine(last + timedelta(days=1), time(0), tzinfo=tz)
+    # Through timestamps: subtracting two datetimes that share a ZoneInfo
+    # ignores the DST switch between them.
+    return begin, int(after.timestamp() - begin.timestamp())
 
 
 def _find_option(
@@ -333,12 +398,13 @@ def configure_polls_tools(mcp: MCPServer):
             description: Optional description shown above the options.
             expire: Optional voting deadline as ISO 8601, e.g.
                 '2026-10-31T18:00'. Without an offset it is read in
-                timezone_name (or UTC if that is not given).
+                the poll's timezone (see timezone_name).
             allow_maybe: Whether participants may answer 'maybe'.
             access: 'private' (only invited participants, the default) or
                 'open' (every user of this Nextcloud can find and join it).
             timezone_name: IANA timezone of the poll, e.g. 'Europe/Berlin'.
-                Date options are shown in it.
+                Date options are shown in it. Defaults to the user's own
+                timezone in Nextcloud (UTC if that is unknown).
 
         The poll starts without options: add them with
         nc_polls_add_date_option or nc_polls_add_text_options. A private poll
@@ -348,21 +414,40 @@ def configure_polls_tools(mcp: MCPServer):
             raise MCPError(code=-1, message="Failed creating poll: title is empty")
         client = await get_client(ctx)
         with _polls_errors("creating poll"):
+            # Check everything that can be checked before the poll exists, so
+            # bad input never leaves a half-configured poll behind. expire is
+            # only parsed here; its zone is known after the POST.
             if timezone_name is not None:
                 _validate_timezone(timezone_name)
-            tz = poll_timezone(timezone_name)
+            _config_changes(timezone.utc, expire=expire)
+            created = await client.polls.create_poll(title, poll_type)
+            # Polls 9.3 passes votingVariant into PollService::add's
+            # timezoneName parameter, so every poll created over the API has
+            # timezoneName "simple". The zone is therefore always set in the
+            # follow-up PUT: the given one, else the owner's own zone from the
+            # POST answer, else UTC.
+            if timezone_name is None:
+                owner_zone = (created.get("owner") or {}).get("timeZone")
+                if _is_iana_zone(owner_zone):
+                    timezone_name = owner_zone
+                else:
+                    logger.debug(
+                        "Owner timezone %r of new poll %s unusable, using UTC",
+                        owner_zone,
+                        created["id"],
+                    )
+                    timezone_name = "UTC"
             changes = _config_changes(
-                tz,
+                poll_timezone(timezone_name),
                 description=description,
                 expire=expire,
                 allow_maybe=allow_maybe,
                 access=access,
             )
-            if timezone_name is not None:
-                changes["timezoneName"] = timezone_name
-            poll = await client.polls.create_poll(title, poll_type)
-            if changes:
-                poll = await client.polls.update_poll(poll["id"], changes)
+            changes["timezoneName"] = timezone_name
+            # The POST answer carries a stale configuration; the PUT answer is
+            # the poll as stored.
+            poll = await client.polls.update_poll(created["id"], changes)
         return CreatePollResponse(poll=Poll.from_api(poll))
 
     @mcp.tool(
@@ -429,6 +514,7 @@ def configure_polls_tools(mcp: MCPServer):
         ctx: Context,
         end: str | None = None,
         duration_minutes: int | None = None,
+        all_day: bool = False,
     ) -> AddPollOptionsResponse:
         """Add a date/time slot to a date poll.
 
@@ -436,35 +522,70 @@ def configure_polls_tools(mcp: MCPServer):
             poll_id: A poll of type 'datePoll'.
             start: Start as ISO 8601, e.g. '2026-10-20T18:00'. Without an
                 offset it is read in the poll's timezone (UTC if it has none).
+                With all_day, a date such as '2026-10-30'.
             end: End as ISO 8601. Give end or duration_minutes, not both.
-                With neither, the slot is a point in time.
-            duration_minutes: Length of the slot in minutes.
+                With neither, the slot is a point in time. With all_day, the
+                last day (inclusive) as a date, by default start.
+            duration_minutes: Length of the slot in minutes. Not with all_day.
+            all_day: True for a slot of whole days, from midnight of start to
+                midnight after end in the poll's timezone. Whether the Polls
+                web interface shows such a slot as all-day is not verified.
 
         The response shows the slot as stored, with an explicit offset, so it
-        can be checked against what was meant.
+        can be checked against what was meant. If the poll already has a slot
+        with the same start and length, nothing is added and note says so.
         """
         if end is not None and duration_minutes is not None:
             raise MCPError(
                 code=-1,
                 message="Failed adding date option: pass end or duration_minutes, not both",
             )
+        if all_day and duration_minutes is not None:
+            raise MCPError(
+                code=-1,
+                message="Failed adding date option: duration_minutes does not apply to all_day",
+            )
         client = await get_client(ctx)
         with _polls_errors(f"adding a date option to poll {poll_id}"):
-            poll = await client.polls.get_poll(poll_id)
+            poll, before, _ = await _poll_with_options(client, poll_id, votes=False)
             if poll.get("type") != DATE_POLL:
                 raise ValueError(
                     "poll is not a date poll, use nc_polls_add_text_options"
                 )
             tz = poll_timezone((poll.get("configuration") or {}).get("timezoneName"))
-            begin = parse_poll_datetime(start, tz)
-            if end is not None:
-                duration = int((parse_poll_datetime(end, tz) - begin).total_seconds())
+            if all_day:
+                begin, duration = _date_slot(start, end, tz)
+                # Hours, not days: Polls adds a D part in the start's fixed
+                # offset, which is an hour off across a DST switch.
+                length = iso_duration(duration, use_days=False)
             else:
-                duration = (duration_minutes or 0) * 60
-            if duration < 0:
-                raise ValueError("the slot ends before it starts")
+                begin = parse_poll_datetime(start, tz).astimezone(tz)
+                if end is not None:
+                    # Through timestamps: subtracting two datetimes that share
+                    # a ZoneInfo ignores a DST switch between them.
+                    duration = int(
+                        parse_poll_datetime(end, tz).timestamp() - begin.timestamp()
+                    )
+                else:
+                    duration = (duration_minutes or 0) * 60
+                if duration < 0:
+                    raise ValueError("the slot ends before it starts")
+                length = iso_duration(duration)
+            known = {o.get("id") for o in before if not o.get("deleted")}
             option = await client.polls.add_option(
-                poll_id, int(begin.timestamp()), duration
+                poll_id, begin.isoformat(timespec="seconds"), length
+            )
+        # Polls answers 201 with the existing option when the slot is already
+        # in the poll; it is reported as such rather than as added.
+        if option.get("id") in known:
+            return AddPollOptionsResponse(
+                poll_id=poll_id,
+                timezone_name=str(tz),
+                added=[],
+                note=(
+                    f"nothing added: the poll already has this slot as option "
+                    f"{option.get('id')}"
+                ),
             )
         return AddPollOptionsResponse(
             poll_id=poll_id,
@@ -541,6 +662,8 @@ def configure_polls_tools(mcp: MCPServer):
             poll, options, _ = await _poll_with_options(client, poll_id, votes=False)
             _find_option(options, option_id, poll_id)
             config = poll.get("configuration") or {}
+            # Polls 9.3 records a 'maybe' even when the poll does not allow
+            # it, so this check is the only one.
             if answer == "maybe" and not config.get("allowMaybe", False):
                 raise ValueError("this poll does not allow 'maybe' answers")
             vote = await client.polls.vote(option_id, answer)
@@ -628,7 +751,11 @@ def configure_polls_tools(mcp: MCPServer):
     @instrument_tool
     async def nc_polls_close_poll(poll_id: int, ctx: Context) -> UpdatePollResponse:
         """Close a poll so no further votes can be cast. Reversible with
-        nc_polls_reopen_poll."""
+        nc_polls_reopen_poll.
+
+        Polls closes a poll by setting its deadline to the moment of closing.
+        Commenting stays possible, and confirmed options stay confirmed.
+        """
         client = await get_client(ctx)
         with _polls_errors(f"closing poll {poll_id}"):
             poll = await client.polls.close_poll(poll_id)
@@ -644,9 +771,9 @@ def configure_polls_tools(mcp: MCPServer):
     async def nc_polls_reopen_poll(poll_id: int, ctx: Context) -> UpdatePollResponse:
         """Reopen a closed poll for voting.
 
-        Polls closes a poll by moving its deadline to the moment of closing, so
-        check the deadline in the returned poll and set a new one with
-        nc_polls_update_poll if needed.
+        Reopening removes the deadline entirely: the poll is open without a
+        deadline afterwards and the earlier deadline is lost. Set a new one
+        with nc_polls_update_poll if needed.
         """
         client = await get_client(ctx)
         with _polls_errors(f"reopening poll {poll_id}"):

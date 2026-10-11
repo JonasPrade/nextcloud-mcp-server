@@ -9,7 +9,7 @@ that an HTTP failure reaches the model as an ``MCPError`` naming the cause.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -25,6 +25,7 @@ from tests.client.polls.test_polls_api import (
     SLOT_WINTER,
     TEXT_POLL_FIXTURE,
     _option,
+    _user,
     _vote,
 )
 
@@ -171,11 +172,34 @@ async def test_get_comments_oldest_first_without_deleted(
 # --- Write tools ---
 
 
+def _created(owner_zone=None):
+    """A POST /poll answer as Polls 9.3 gives it.
+
+    ``timezoneName`` is "simple" (the voting variant, see Polls' add()) and the
+    configuration is stale; ``owner.timeZone`` is the user's own zone.
+    """
+    owner = _user("alice", "Alice A.")
+    if owner_zone is not None:
+        owner["timeZone"] = owner_zone
+    return {
+        **POLL_FIXTURE,
+        "id": 9,
+        "configuration": {
+            **POLL_FIXTURE["configuration"],
+            "timezoneName": "simple",
+            "allowMaybe": False,
+        },
+        "owner": owner,
+    }
+
+
 async def test_create_poll_with_settings(polls_tools, stub_client, mocker):
-    """Settings beyond title and type go out in one follow-up update."""
-    created = {**POLL_FIXTURE, "id": 9}
-    stub_client.polls.create_poll = mocker.AsyncMock(return_value=created)
-    stub_client.polls.update_poll = mocker.AsyncMock(return_value=created)
+    """Settings go out in one follow-up update; the poll comes from its answer."""
+    stub_client.polls.create_poll = mocker.AsyncMock(
+        return_value=_created("America/New_York")
+    )
+    stored = {**POLL_FIXTURE, "id": 9}
+    stub_client.polls.update_poll = mocker.AsyncMock(return_value=stored)
 
     result = await _call(
         polls_tools,
@@ -190,10 +214,10 @@ async def test_create_poll_with_settings(polls_tools, stub_client, mocker):
         timezone_name="Europe/Berlin",
     )
 
-    assert result.poll.id == 9
     stub_client.polls.create_poll.assert_awaited_once_with(
         "Vorstandssitzung", "datePoll"
     )
+    # The explicit zone wins over the owner's.
     stub_client.polls.update_poll.assert_awaited_once_with(
         9,
         {
@@ -204,20 +228,66 @@ async def test_create_poll_with_settings(polls_tools, stub_client, mocker):
             "timezoneName": "Europe/Berlin",
         },
     )
+    # Not the stale POST answer (allowMaybe False, timezoneName "simple").
+    assert result.poll.configuration.allow_maybe is True
+    assert result.poll.configuration.timezone_name == "Europe/Berlin"
 
 
-async def test_create_poll_without_settings_skips_the_update(
-    polls_tools, stub_client, mocker
+@pytest.mark.parametrize(
+    ("owner_zone", "expected"),
+    [
+        ("Europe/Berlin", "Europe/Berlin"),
+        (None, "UTC"),
+        ("", "UTC"),
+        ("Mars/Olympus", "UTC"),
+    ],
+)
+async def test_create_poll_always_sets_the_timezone(
+    polls_tools, stub_client, mocker, owner_zone, expected
 ):
-    """Title and type alone need no second request."""
-    stub_client.polls.create_poll = mocker.AsyncMock(return_value=TEXT_POLL_FIXTURE)
-    stub_client.polls.update_poll = mocker.AsyncMock()
+    """Without timezone_name the owner's zone is sent, or UTC if it is unusable.
 
-    await _call(
-        polls_tools, mocker, "nc_polls_create_poll", title="Ort", poll_type="textPoll"
+    Even title and type alone need the update: Polls 9.3 stores the voting
+    variant as timezoneName.
+    """
+    stub_client.polls.create_poll = mocker.AsyncMock(return_value=_created(owner_zone))
+    stub_client.polls.update_poll = mocker.AsyncMock(
+        return_value={**POLL_FIXTURE, "id": 9}
     )
 
-    stub_client.polls.update_poll.assert_not_awaited()
+    await _call(
+        polls_tools, mocker, "nc_polls_create_poll", title="T", poll_type="datePoll"
+    )
+
+    stub_client.polls.update_poll.assert_awaited_once_with(
+        9, {"timezoneName": expected}
+    )
+
+
+@pytest.mark.parametrize(
+    ("owner_zone", "tz"),
+    [("Europe/Berlin", BERLIN), ("Mars/Olympus", timezone.utc)],
+)
+async def test_create_poll_reads_expire_in_the_resolved_zone(
+    polls_tools, stub_client, mocker, owner_zone, tz
+):
+    """A deadline without offset is local to the zone the poll ends up in."""
+    stub_client.polls.create_poll = mocker.AsyncMock(return_value=_created(owner_zone))
+    stub_client.polls.update_poll = mocker.AsyncMock(
+        return_value={**POLL_FIXTURE, "id": 9}
+    )
+
+    await _call(
+        polls_tools,
+        mocker,
+        "nc_polls_create_poll",
+        title="T",
+        poll_type="datePoll",
+        expire="2026-10-31T18:00",
+    )
+
+    sent = stub_client.polls.update_poll.await_args.args[1]
+    assert sent["expire"] == int(datetime(2026, 10, 31, 18, 0, tzinfo=tz).timestamp())
 
 
 @pytest.mark.parametrize(
@@ -299,10 +369,56 @@ async def test_update_poll_rejects_empty_or_conflicting_changes(
     stub_client.polls.update_poll.assert_not_awaited()
 
 
-async def test_add_date_option_local_time_and_duration(
+@pytest.mark.parametrize(
+    ("kwargs", "iso_timestamp", "iso_duration"),
+    [
+        # Summer time: +02:00, end becomes a duration.
+        (
+            {"start": "2026-10-23T18:00", "end": "2026-10-23T20:00"},
+            "2026-10-23T18:00:00+02:00",
+            "PT2H",
+        ),
+        # After the DST switch: +01:00.
+        (
+            {"start": "2026-10-27T18:00", "duration_minutes": 90},
+            "2026-10-27T18:00:00+01:00",
+            "PT1H30M",
+        ),
+        # A point in time: no duration at all.
+        ({"start": "2026-10-23T18:00"}, "2026-10-23T18:00:00+02:00", None),
+        # An explicit offset is honoured, then expressed in the poll's zone.
+        (
+            {"start": "2026-10-20T16:00:00+00:00", "duration_minutes": 60},
+            "2026-10-20T18:00:00+02:00",
+            "PT1H",
+        ),
+        # end across the DST switch: 25 wall-clock hours are 26 real ones.
+        (
+            {"start": "2026-10-24T18:00", "end": "2026-10-25T19:00"},
+            "2026-10-24T18:00:00+02:00",
+            "P1DT2H",
+        ),
+    ],
+)
+async def test_add_date_option_sends_iso_in_the_polls_zone(
+    polls_tools, stub_client, mocker, kwargs, iso_timestamp, iso_duration
+):
+    """Start goes out as ISO 8601 in the poll's zone, the length as ISO duration."""
+    stub_client.polls.add_option = mocker.AsyncMock(
+        return_value=_option(5, SLOT_SUMMER, 3, duration=5400)
+    )
+
+    await _call(polls_tools, mocker, "nc_polls_add_date_option", poll_id=7, **kwargs)
+
+    stub_client.polls.add_option.assert_awaited_once_with(
+        7, iso_timestamp, iso_duration
+    )
+
+
+async def test_add_date_option_reports_the_stored_slot(
     polls_tools, stub_client, mocker
 ):
-    """Start without offset is local to the poll; end becomes a duration."""
+    """start and end in the answer come from Polls' timestamp and duration."""
     stub_client.polls.add_option = mocker.AsyncMock(
         return_value=_option(5, SLOT_SUMMER, 3, duration=5400)
     )
@@ -316,15 +432,52 @@ async def test_add_date_option_local_time_and_duration(
         end="2026-10-20T19:30",
     )
 
-    stub_client.polls.add_option.assert_awaited_once_with(7, SLOT_SUMMER, 5400)
+    assert result.note is None
+    assert [o.id for o in result.added] == [5]
     assert result.added[0].start.isoformat() == "2026-10-20T18:00:00+02:00"
     assert result.added[0].end.isoformat() == "2026-10-20T19:30:00+02:00"
 
 
-async def test_add_date_option_explicit_offset_wins(polls_tools, stub_client, mocker):
-    """An offset in the input is honoured rather than the poll's timezone."""
+async def test_add_date_option_existing_slot_is_not_reported_as_added(
+    polls_tools, stub_client, mocker
+):
+    """Polls answers 201 with the existing option for a duplicate slot."""
     stub_client.polls.add_option = mocker.AsyncMock(
-        return_value=_option(5, SLOT_SUMMER, 3, duration=3600)
+        return_value=_option(1, SLOT_SUMMER, 1)
+    )
+
+    result = await _call(
+        polls_tools,
+        mocker,
+        "nc_polls_add_date_option",
+        poll_id=7,
+        start="2026-10-20T18:00",
+        duration_minutes=120,
+    )
+
+    assert result.added == []
+    assert "already has this slot as option 1" in result.note
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "iso_timestamp", "iso_duration"),
+    [
+        ({"start": "2026-10-30"}, "2026-10-30T00:00:00+01:00", "PT24H"),
+        # Over the DST switch on 25 October: 49 hours, not P2D.
+        (
+            {"start": "2026-10-24", "end": "2026-10-25"},
+            "2026-10-24T00:00:00+02:00",
+            "PT49H",
+        ),
+        ({"start": "2026-10-25"}, "2026-10-25T00:00:00+02:00", "PT25H"),
+    ],
+)
+async def test_add_all_day_option(
+    polls_tools, stub_client, mocker, kwargs, iso_timestamp, iso_duration
+):
+    """All-day slots run from midnight to midnight after the last day."""
+    stub_client.polls.add_option = mocker.AsyncMock(
+        return_value=_option(5, SLOT_SUMMER, 3, duration=86400)
     )
 
     await _call(
@@ -332,11 +485,13 @@ async def test_add_date_option_explicit_offset_wins(polls_tools, stub_client, mo
         mocker,
         "nc_polls_add_date_option",
         poll_id=7,
-        start="2026-10-20T16:00:00+00:00",
-        duration_minutes=60,
+        all_day=True,
+        **kwargs,
     )
 
-    stub_client.polls.add_option.assert_awaited_once_with(7, SLOT_SUMMER, 3600)
+    stub_client.polls.add_option.assert_awaited_once_with(
+        7, iso_timestamp, iso_duration
+    )
 
 
 @pytest.mark.parametrize(
@@ -357,13 +512,28 @@ async def test_add_date_option_explicit_offset_wins(polls_tools, stub_client, mo
             "not both",
         ),
         (TEXT_POLL_FIXTURE, {"start": "2026-10-20T18:00"}, "not a date poll"),
+        (
+            POLL_FIXTURE,
+            {"start": "2026-10-30", "all_day": True, "duration_minutes": 60},
+            "does not apply to all_day",
+        ),
+        (
+            POLL_FIXTURE,
+            {"start": "2026-10-30T18:00", "all_day": True},
+            "must be dates",
+        ),
+        (
+            POLL_FIXTURE,
+            {"start": "2026-10-30", "end": "2026-10-29", "all_day": True},
+            "ends before it starts",
+        ),
     ],
 )
 async def test_add_date_option_rejects_bad_input(
     polls_tools, stub_client, mocker, poll, kwargs, message
 ):
     """Nothing is added when the slot or the poll type is wrong."""
-    stub_client.polls.get_poll.return_value = poll
+    stub_client.polls.get_poll_details.return_value = {"poll": poll}
     stub_client.polls.add_option = mocker.AsyncMock()
 
     with pytest.raises(MCPError, match=message):
@@ -544,42 +714,91 @@ async def test_close_and_reopen(polls_tools, stub_client, mocker, tool, method):
 # --- Errors, links, annotations ---
 
 
+def _http_error(status, message=None):
+    request = httpx.Request("GET", "https://nc.example/ocs/v2.php/apps/polls")
+    json = None
+    if message is not None:
+        json = {
+            "ocs": {
+                "meta": {"status": "failure", "statuscode": status, "message": message},
+                "data": [],
+            }
+        }
+    return httpx.HTTPStatusError(
+        "boom",
+        request=request,
+        response=httpx.Response(status, request=request, json=json),
+    )
+
+
+SQL_MESSAGE = (
+    'Did expect one result but found none when executing: query "SELECT '
+    "`polls_polls`.* FROM `oc_polls_polls` `polls_polls` WHERE `polls_polls`.`id` "
+    '= :dcValue1" ' + "x" * 300
+)
+
+
 @pytest.mark.parametrize(
-    ("status", "detail"),
+    ("status", "message", "expected"),
     [
-        (404, "not found, or not shared with you"),
-        (403, "not allowed"),
-        (500, "server error (500)"),
+        (404, None, "Failed getting poll 99: not found, or not shared with you"),
+        (403, None, "Failed getting poll 99: not allowed"),
+        (500, None, "Failed getting poll 99: server error (500)"),
+        (
+            400,
+            "Poll not found",
+            "Failed getting poll 99: not found, or not shared with you (Poll not found)",
+        ),
+        (
+            400,
+            "denied permission vote",
+            "Failed getting poll 99: not allowed — ",
+        ),
+        (404, SQL_MESSAGE, "Failed getting poll 99: not found, or not shared with you"),
+        (
+            400,
+            "Title must not be empty",
+            "Failed getting poll 99: request rejected (400) (Title must not be empty)",
+        ),
+        (
+            500,
+            "Internal Server Error",
+            "Failed getting poll 99: server error (500) (Internal Server Error)",
+        ),
     ],
 )
 async def test_http_errors_become_mcp_errors(
-    polls_tools, stub_client, mocker, status, detail
+    polls_tools, stub_client, mocker, status, message, expected
 ):
-    """Each failure class reaches the model with a reason it can act on."""
-    request = httpx.Request("GET", "https://nc.example/ocs/v2.php/apps/polls")
-    stub_client.polls.get_poll.side_effect = httpx.HTTPStatusError(
-        "boom", request=request, response=httpx.Response(status, request=request)
-    )
+    """Each failure is classified by status and message, without SQL text."""
+    stub_client.polls.get_poll.side_effect = _http_error(status, message)
 
-    with pytest.raises(MCPError, match=re.escape(detail)):
+    with pytest.raises(MCPError) as excinfo:
         await _call(polls_tools, mocker, "nc_polls_get_poll", poll_id=99)
+
+    text = str(excinfo.value)
+    assert text.startswith(expected)
+    assert "SELECT" not in text
+    if status == 404 and message:
+        assert text == expected
+
+
+async def test_long_server_message_is_cut(polls_tools, stub_client, mocker):
+    """A server message reaches the model with at most 200 characters."""
+    stub_client.polls.get_poll.side_effect = _http_error(400, "A" * 500)
+
+    with pytest.raises(MCPError) as excinfo:
+        await _call(polls_tools, mocker, "nc_polls_get_poll", poll_id=99)
+
+    reason = str(excinfo.value).split("(400) (", 1)[1][:-1]
+    assert len(reason) == 200
+    assert reason.endswith("…")
 
 
 async def test_server_reason_is_passed_on(polls_tools, stub_client, mocker):
     """When Polls says why it refused, the model sees that reason."""
-    request = httpx.Request("PUT", "https://nc.example/ocs/v2.php/apps/polls")
-    response = httpx.Response(
-        403,
-        request=request,
-        json={
-            "ocs": {
-                "meta": {"statuscode": 403, "message": "Poll is closed"},
-                "data": [],
-            }
-        },
-    )
     stub_client.polls.close_poll = mocker.AsyncMock(
-        side_effect=httpx.HTTPStatusError("boom", request=request, response=response)
+        side_effect=_http_error(403, "Poll is closed")
     )
 
     with pytest.raises(MCPError, match="Poll is closed"):
