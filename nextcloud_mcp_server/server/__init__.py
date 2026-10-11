@@ -12,6 +12,7 @@ from .deck import configure_deck_tools
 from .mail import configure_mail_tools
 from .news import configure_news_tools
 from .notes import configure_notes_tools
+from .polls import configure_polls_tools
 from .sharing import configure_sharing_tools
 from .shopping_list import configure_shopping_list_tools
 from .tables import configure_tables_tools
@@ -38,6 +39,7 @@ AVAILABLE_APPS: dict[str, Callable[[MCPServer], None]] = {
     "mail": configure_mail_tools,
     "talk": configure_talk_tools,
     "shopping_list": configure_shopping_list_tools,
+    "polls": configure_polls_tools,
 }
 
 # App name → the key it publishes on /ocs/v2.php/cloud/capabilities, for apps
@@ -55,6 +57,7 @@ AVAILABLE_APPS: dict[str, Callable[[MCPServer], None]] = {
 #   collectives / news / mail        → publish no capability block at all
 #   shopping_list                    → likewise; gating it would hide working
 #                                      tools on every instance that has it
+#   polls                            → own key `polls`
 #   webdav / sharing                 → core `files`/`files_sharing`, always there
 APP_CAPABILITY_KEY: dict[str, str] = {
     "notes": "notes",
@@ -62,6 +65,7 @@ APP_CAPABILITY_KEY: dict[str, str] = {
     "deck": "deck",
     "cookbook": "cookbook",
     "talk": "spreed",
+    "polls": "polls",
 }
 
 
@@ -95,6 +99,7 @@ __all__ = [
     "configure_mail_tools",
     "configure_news_tools",
     "configure_notes_tools",
+    "configure_polls_tools",
     "configure_sharing_tools",
     "configure_shopping_list_tools",
     "configure_tables_tools",

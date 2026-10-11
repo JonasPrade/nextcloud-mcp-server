@@ -93,6 +93,7 @@ For Kubernetes, see [cbcoutinho/helm-charts](https://github.com/cbcoutinho/helm-
 | **Mail** | 13 | Accounts, mailboxes, messages, attachments, send; flags (read/unread, star), tags, move, delete |
 | **Collectives** | 16 | Full CRUD on collectives, pages, and tags |
 | **Talk (spreed)** | 6 | List conversations, read/post messages, mark as read, list participants |
+| **Polls** | 4 | Read polls, options (date slots in the poll's timezone) and results with voter names |
 | **Shopping List** | 12 | Lists and items — add a whole recipe's ingredients in one call, tick items off, clear checked |
 | **Semantic Search** | 2+ | Vector search for Notes, Files, News items, Deck cards, and Mail messages (experimental, opt-in, requires infrastructure) |
 
