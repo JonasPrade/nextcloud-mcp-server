@@ -318,3 +318,105 @@ def test_tally_keeps_options_without_votes():
     assert len(results) == 1
     assert (results[0].yes, results[0].maybe, results[0].no) == (0, 0, 0)
     assert participants == []
+
+
+# --- Writes ---
+
+
+@pytest.mark.parametrize(
+    ("call", "method", "path", "body", "key"),
+    [
+        (
+            lambda c: c.create_poll("T", "datePoll"),
+            "POST",
+            "/poll",
+            {"title": "T", "type": "datePoll", "votingVariant": "simple"},
+            "poll",
+        ),
+        (
+            lambda c: c.update_poll(7, {"title": "T"}),
+            "PUT",
+            "/poll/7",
+            {"pollConfiguration": {"title": "T"}},
+            "poll",
+        ),
+        (
+            lambda c: c.add_option(7, SLOT_SUMMER, 3600),
+            "POST",
+            "/poll/7/option",
+            {"option": {"timestamp": SLOT_SUMMER, "duration": 3600}},
+            "option",
+        ),
+        (
+            lambda c: c.add_text_options(7, ["A", "B"]),
+            "POST",
+            "/poll/7/options",
+            {"text": "A\nB"},
+            "options",
+        ),
+        (
+            lambda c: c.add_comment(7, "Hallo"),
+            "POST",
+            "/poll/7/comment",
+            {"comment": "Hallo", "confidential": False},
+            "comment",
+        ),
+    ],
+)
+async def test_write_routes_send_the_documented_body(
+    mocker, call, method, path, body, key
+):
+    """Each write hits its route with the body openapi.json documents."""
+    client, mock_make_request = _client(mocker, _ocs({key: {"id": 1}}))
+
+    await call(client)
+
+    assert mock_make_request.call_args.args == (method, f"{API}{path}")
+    assert mock_make_request.call_args.kwargs["json"] == body
+
+
+@pytest.mark.parametrize(
+    ("call", "path", "key"),
+    [
+        (lambda c: c.vote(5, "yes"), "/option/5/vote/yes", "vote"),
+        (lambda c: c.toggle_option_confirmation(5), "/option/5/confirm", "option"),
+        (lambda c: c.close_poll(7), "/poll/7/close", "poll"),
+        (lambda c: c.reopen_poll(7), "/poll/7/reopen", "poll"),
+    ],
+)
+async def test_bodyless_puts_send_no_json(mocker, call, path, key):
+    """Routes without a body get no ``json=`` and so no Content-Type."""
+    client, mock_make_request = _client(mocker, _ocs({key: {"id": 1}}))
+
+    await call(client)
+
+    assert mock_make_request.call_args.args == ("PUT", f"{API}{path}")
+    assert "json" not in mock_make_request.call_args.kwargs
+
+
+async def test_get_comments(mocker):
+    client, mock_make_request = _client(mocker, _ocs({"comments": [{"id": 1}]}))
+
+    assert await client.get_comments(7) == [{"id": 1}]
+    assert mock_make_request.call_args.args == ("GET", f"{API}/poll/7/comments")
+
+
+@pytest.mark.parametrize("answer", ["", "YES", "../poll/1", "abstain"])
+async def test_vote_answer_is_checked_before_it_reaches_the_path(mocker, answer):
+    """The answer is a URL path segment, so only Polls' three values pass."""
+    client, mock_make_request = _client(mocker, _ocs({}))
+
+    with pytest.raises(ValueError, match="Answer must be one of"):
+        await client.vote(5, answer)
+
+    mock_make_request.assert_not_called()
+
+
+@pytest.mark.parametrize("bad_id", [0, -3, True])
+async def test_invalid_option_id_never_reaches_the_wire(mocker, bad_id):
+    client, mock_make_request = _client(mocker, _ocs({}))
+
+    with pytest.raises(ValueError, match="Option ID"):
+        await client.vote(bad_id, "yes")
+
+    mock_make_request.assert_not_called()

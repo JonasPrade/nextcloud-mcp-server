@@ -161,9 +161,11 @@ async def test_update_operations_not_idempotent(nc_mcp_client: ClientSession):
     # same fields sent twice leave the same end state, because there is no
     # version for the first call to have invalidated. The Shopping List app
     # stores neither on a list or an item.
+    # Polls keeps no version on a poll's configuration either.
     idempotent_exceptions = {
         "nc_shopping_list_update_list",
         "nc_shopping_list_update_item",
+        "nc_polls_update_poll",
     }
 
     for tool in tools.tools:

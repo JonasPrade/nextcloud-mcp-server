@@ -1,7 +1,8 @@
-"""End-to-end coverage of the read-only Polls MCP tools against a real stack.
+"""End-to-end coverage of the Polls MCP tools against a real stack.
 
-The MCP server has no tools to write polls yet, so the fixture sets one up
-through the Polls OCS API directly: a date poll with two slots and one vote.
+The read test sets its poll up through the Polls OCS API directly, so it does
+not depend on the write tools; the write test then drives the whole organiser
+flow through the tools themselves. Both clean up through the API.
 """
 
 import json
@@ -44,6 +45,21 @@ async def _ocs(nc_client: NextcloudClient, method: str, path: str, **kwargs) -> 
     return response.json()["ocs"]["data"]
 
 
+async def _remove_poll(nc_client: NextcloudClient, poll_id: int) -> None:
+    """Archive, then delete a test poll; never let a failed cleanup mask a result.
+
+    Polls only deletes archived polls on some versions, hence both steps.
+    """
+    for method, path in (
+        ("PUT", f"/poll/{poll_id}/archive/toggle"),
+        ("DELETE", f"/poll/{poll_id}"),
+    ):
+        try:
+            await _ocs(nc_client, method, path)
+        except Exception:
+            logger.warning("Poll cleanup %s %s failed", method, path)
+
+
 @pytest.fixture
 async def temporary_poll(
     nc_client: NextcloudClient,
@@ -67,17 +83,7 @@ async def temporary_poll(
         await _ocs(nc_client, "PUT", f"/option/{option_ids[SLOT_B]}/vote/yes")
         yield {"id": poll_id, "title": title, "option_ids": option_ids}
     finally:
-        # Polls only deletes archived polls on some versions; archive first and
-        # keep going if either step fails, so a broken cleanup never hides the
-        # test result.
-        for method, path in (
-            ("PUT", f"/poll/{poll_id}/archive/toggle"),
-            ("DELETE", f"/poll/{poll_id}"),
-        ):
-            try:
-                await _ocs(nc_client, method, path)
-            except Exception:
-                logger.warning("Poll cleanup %s %s failed", method, path)
+        await _remove_poll(nc_client, poll_id)
 
 
 async def test_mcp_polls_read_round_trip(
@@ -128,3 +134,121 @@ async def test_mcp_polls_read_round_trip(
 async def test_mcp_polls_unknown_poll_is_an_error(nc_mcp_client: ClientSession):
     result = await nc_mcp_client.call_tool("nc_polls_get_poll", {"poll_id": 999999999})
     assert result.is_error is True
+
+
+async def test_mcp_polls_write_round_trip(
+    nc_mcp_client: ClientSession, nc_client: NextcloudClient
+):
+    """Create a date poll, add slots, vote, comment, confirm, close, reopen."""
+    title = f"MCP Write Poll {uuid.uuid4().hex[:8]}"
+    poll_id = None
+    try:
+        created = _payload(
+            await nc_mcp_client.call_tool(
+                "nc_polls_create_poll",
+                {
+                    "title": title,
+                    "poll_type": "datePoll",
+                    "description": "created by the MCP integration tests",
+                    "allow_maybe": True,
+                    "timezone_name": "Europe/Berlin",
+                },
+            )
+        )
+        poll_id = created["poll"]["id"]
+        assert created["poll"]["configuration"]["title"] == title
+        assert created["poll"]["configuration"]["allow_maybe"] is True
+
+        # Verify via the direct client, not only through the tool that made it.
+        direct = await nc_client.polls.get_poll(poll_id)
+        assert direct["configuration"]["title"] == title
+
+        first = _payload(
+            await nc_mcp_client.call_tool(
+                "nc_polls_add_date_option",
+                {
+                    "poll_id": poll_id,
+                    "start": "2030-03-04T10:00:00+00:00",
+                    "duration_minutes": 90,
+                },
+            )
+        )
+        second = _payload(
+            await nc_mcp_client.call_tool(
+                "nc_polls_add_date_option",
+                {
+                    "poll_id": poll_id,
+                    "start": "2030-03-05T10:00:00+00:00",
+                    "end": "2030-03-05T11:00:00+00:00",
+                },
+            )
+        )
+        first_id = first["added"][0]["id"]
+        second_id = second["added"][0]["id"]
+        options = await nc_client.polls.get_options(poll_id)
+        by_id = {o["id"]: o for o in options}
+        assert by_id[first_id]["timestamp"] == SLOT_A
+        assert by_id[first_id]["duration"] == 5400
+        assert by_id[second_id]["duration"] == 3600
+
+        for option_id, answer in ((first_id, "maybe"), (second_id, "yes")):
+            voted = _payload(
+                await nc_mcp_client.call_tool(
+                    "nc_polls_vote",
+                    {"poll_id": poll_id, "option_id": option_id, "answer": answer},
+                )
+            )
+            assert voted["answer"] == answer
+
+        commented = _payload(
+            await nc_mcp_client.call_tool(
+                "nc_polls_add_comment",
+                {"poll_id": poll_id, "comment": "Dienstag passt besser"},
+            )
+        )
+        assert commented["comment"]["comment"] == "Dienstag passt besser"
+        comments = _payload(
+            await nc_mcp_client.call_tool("nc_polls_get_comments", {"poll_id": poll_id})
+        )
+        assert [c["comment"] for c in comments["results"]] == ["Dienstag passt besser"]
+
+        results = _payload(
+            await nc_mcp_client.call_tool("nc_polls_get_results", {"poll_id": poll_id})
+        )
+        assert [r["option_id"] for r in results["results"]] == [second_id, first_id]
+        assert results["results"][1]["maybe"] == 1
+
+        closed = _payload(
+            await nc_mcp_client.call_tool("nc_polls_close_poll", {"poll_id": poll_id})
+        )
+        # Not asserting is_expired: Polls closes by setting the deadline to
+        # "now", and whether that already reads as expired is a matter of
+        # the same second.
+        assert closed["poll"]["id"] == poll_id
+
+        # Confirming twice leaves it confirmed: the tool is a setter, not a toggle.
+        for expected_change in (True, False):
+            confirmed = _payload(
+                await nc_mcp_client.call_tool(
+                    "nc_polls_confirm_option",
+                    {"poll_id": poll_id, "option_id": second_id, "confirmed": True},
+                )
+            )
+            assert confirmed["changed"] is expected_change
+            assert confirmed["option"]["confirmed"] is True
+
+        reopened = _payload(
+            await nc_mcp_client.call_tool("nc_polls_reopen_poll", {"poll_id": poll_id})
+        )
+        assert reopened["poll"]["id"] == poll_id
+
+        updated = _payload(
+            await nc_mcp_client.call_tool(
+                "nc_polls_update_poll",
+                {"poll_id": poll_id, "title": f"{title} (renamed)"},
+            )
+        )
+        assert updated["poll"]["configuration"]["title"] == f"{title} (renamed)"
+    finally:
+        if poll_id is not None:
+            await _remove_poll(nc_client, poll_id)

@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from nextcloud_mcp_server.links import _URL_BUILDERS
 from nextcloud_mcp_server.server.deck import configure_deck_tools
 from nextcloud_mcp_server.server.notes import configure_notes_tools
+from nextcloud_mcp_server.server.polls import configure_polls_tools
 from nextcloud_mcp_server.server.webdav import configure_webdav_tools
 
 pytestmark = pytest.mark.unit
@@ -59,10 +60,11 @@ def _linkable_models(annotation: object, seen: set[type] | None = None) -> set[t
 
 
 def _all_tools() -> dict:
-    """Register the three link-carrying tool modules and return them by name."""
+    """Register the link-carrying tool modules and return them by name."""
     mcp = MCPServer(name="test-link-coverage")
     configure_deck_tools(mcp)
     configure_notes_tools(mcp)
+    configure_polls_tools(mcp)
     configure_webdav_tools(mcp)
     return {t.name: t for t in mcp._tool_manager.list_tools()}
 

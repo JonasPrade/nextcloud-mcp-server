@@ -1,37 +1,80 @@
-"""MCP tools for the Nextcloud Polls app (read-only).
+"""MCP tools for the Nextcloud Polls app.
 
-Polls answers a missing poll with 404 and a poll the user may not see with
-403, so the translation to ``MCPError`` lives in one context manager rather
-than a try/except per tool.
+Reading needs ``polls.read``; creating and configuring polls, adding options,
+voting, commenting, confirming an option and closing or reopening a poll need
+``polls.write``. Deleting, archiving and sharing are deliberately not exposed:
+the first two cannot be undone from here, and sharing notifies third parties.
+
+Polls answers a missing poll with 404 and a forbidden action with 403, so the
+translation to ``MCPError`` lives in one context manager rather than a
+try/except per tool. Every response carries a ``url`` that opens the poll.
 """
 
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from httpx import HTTPStatusError, RequestError
+from httpx import HTTPStatusError, RequestError, Response
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.shared.exceptions import MCPError
 from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.client import NextcloudClient
+from nextcloud_mcp_server.client.ocs import parse_ocs_envelope
 from nextcloud_mcp_server.context import get_client
+from nextcloud_mcp_server.links import with_links
 from nextcloud_mcp_server.models.polls import (
+    DATE_POLL,
+    TEXT_POLL,
+    AddPollCommentResponse,
+    AddPollOptionsResponse,
+    ConfirmPollOptionResponse,
+    CreatePollResponse,
     GetPollResponse,
+    ListPollCommentsResponse,
     ListPollOptionsResponse,
     ListPollsResponse,
     Poll,
+    PollAccess,
+    PollComment,
     PollOption,
     PollResultsResponse,
     PollSummary,
+    PollType,
+    UpdatePollResponse,
+    VoteAnswer,
+    VoteResponse,
+    parse_poll_datetime,
     poll_timezone,
     tally_results,
 )
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 
 logger = logging.getLogger(__name__)
+
+#: Polls' comment field is a TEXT column, but a comment longer than this is
+#: almost certainly a mistake by the calling model; reject it with a clear
+#: message rather than posting a wall of text into a shared poll.
+_COMMENT_MAX_LENGTH = 4000
+
+
+def _server_message(response: Response) -> str | None:
+    """The reason Polls gave for a failed request, if it gave one."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    envelope = parse_ocs_envelope(payload)
+    # "Unknown error" is parse_ocs_envelope's stand-in for "no message sent".
+    if envelope.message != "Unknown error":
+        return envelope.message
+    if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+        return payload["message"]
+    return None
 
 
 @contextmanager
@@ -46,12 +89,27 @@ def _polls_errors(action: str) -> Iterator[None]:
     except HTTPStatusError as e:
         status = e.response.status_code
         if status == 404:
-            detail = "poll not found, or not shared with you"
+            detail = "not found, or not shared with you"
         elif status == 403:
-            detail = "you do not have access to this poll"
+            detail = (
+                "not allowed — you may lack access or the right to change this "
+                "poll, or the poll is closed or locked"
+            )
         else:
             detail = f"server error ({status})"
+        reason = _server_message(e.response)
+        if reason:
+            detail = f"{detail} ({reason})"
         raise MCPError(code=-1, message=f"Failed {action}: {detail}")
+
+
+def _validate_timezone(name: str) -> None:
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise ValueError(
+            f"unknown timezone {name!r}, expected an IANA name like Europe/Berlin"
+        ) from e
 
 
 async def _poll_with_options(
@@ -76,21 +134,64 @@ async def _poll_with_options(
     return details["poll"], options, vote_list
 
 
+def _find_option(
+    options: list[dict[str, Any]], option_id: int, poll_id: int
+) -> dict[str, Any]:
+    for option in options:
+        if option.get("id") == option_id and not option.get("deleted"):
+            return option
+    raise ValueError(f"option {option_id} is not an option of poll {poll_id}")
+
+
+def _config_changes(
+    tz: ZoneInfo | timezone,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    expire: str | None = None,
+    remove_expire: bool = False,
+    allow_maybe: bool | None = None,
+    access: str | None = None,
+) -> dict[str, Any]:
+    """Polls configuration keys for the arguments that were actually given."""
+    if expire is not None and remove_expire:
+        raise ValueError("pass either expire or remove_expire, not both")
+    changes: dict[str, Any] = {}
+    if title is not None:
+        if not title.strip():
+            raise ValueError("title must not be empty")
+        changes["title"] = title
+    if description is not None:
+        changes["description"] = description
+    if expire is not None:
+        changes["expire"] = int(parse_poll_datetime(expire, tz).timestamp())
+    if remove_expire:
+        changes["expire"] = 0  # Polls' "no deadline"
+    if allow_maybe is not None:
+        changes["allowMaybe"] = allow_maybe
+    if access is not None:
+        changes["access"] = access
+    return changes
+
+
 def configure_polls_tools(mcp: MCPServer):
     """Configure Polls app MCP tools."""
+
+    # --- Read tools ---
 
     @mcp.tool(
         title="List Polls",
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     )
     @require_scopes("polls.read")
+    @with_links
     @instrument_tool
     async def nc_polls_list_polls(ctx: Context) -> ListPollsResponse:
         """List every poll the user owns or can access.
 
         Each entry carries the ID, title, type ('datePoll' for scheduling,
-        'textPoll' for text answers), voting deadline, archived/expired flags
-        and owner. Use the ID with the other nc_polls_* tools.
+        'textPoll' for text answers), voting deadline, archived/expired flags,
+        owner and a link to the poll. Use the ID with the other nc_polls_* tools.
         """
         client = await get_client(ctx)
         with _polls_errors("listing polls"):
@@ -102,9 +203,10 @@ def configure_polls_tools(mcp: MCPServer):
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     )
     @require_scopes("polls.read")
+    @with_links
     @instrument_tool
     async def nc_polls_get_poll(poll_id: int, ctx: Context) -> GetPollResponse:
-        """Get a single poll with its full configuration and status."""
+        """Get a single poll with its full configuration, status and link."""
         client = await get_client(ctx)
         with _polls_errors(f"getting poll {poll_id}"):
             data = await client.polls.get_poll(poll_id)
@@ -115,6 +217,7 @@ def configure_polls_tools(mcp: MCPServer):
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     )
     @require_scopes("polls.read")
+    @with_links
     @instrument_tool
     async def nc_polls_get_options(
         poll_id: int, ctx: Context
@@ -151,6 +254,7 @@ def configure_polls_tools(mcp: MCPServer):
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     )
     @require_scopes("polls.read")
+    @with_links
     @instrument_tool
     async def nc_polls_get_results(poll_id: int, ctx: Context) -> PollResultsResponse:
         """Get the tally of a poll: per option the yes/maybe/no counts and the
@@ -175,3 +279,376 @@ def configure_polls_tools(mcp: MCPServer):
             results=results,
             total=len(results),
         )
+
+    @mcp.tool(
+        title="Get Poll Comments",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    )
+    @require_scopes("polls.read")
+    @with_links
+    @instrument_tool
+    async def nc_polls_get_comments(
+        poll_id: int, ctx: Context
+    ) -> ListPollCommentsResponse:
+        """Get the comments on a poll, oldest first.
+
+        Confidential comments are only returned to the poll owner and their
+        author. Deleted comments are left out.
+        """
+        client = await get_client(ctx)
+        with _polls_errors(f"getting comments of poll {poll_id}"):
+            raw = await client.polls.get_comments(poll_id)
+        comments = sorted(
+            (PollComment.from_api(c) for c in raw if not c.get("deleted")),
+            key=lambda c: (c.created is None, c.created, c.id),
+        )
+        return ListPollCommentsResponse(
+            poll_id=poll_id, results=comments, total=len(comments)
+        )
+
+    # --- Write tools ---
+
+    @mcp.tool(
+        title="Create Poll",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("polls.write")
+    @with_links
+    @instrument_tool
+    async def nc_polls_create_poll(
+        title: str,
+        poll_type: PollType,
+        ctx: Context,
+        description: str | None = None,
+        expire: str | None = None,
+        allow_maybe: bool | None = None,
+        access: PollAccess | None = None,
+        timezone_name: str | None = None,
+    ) -> CreatePollResponse:
+        """Create a poll and return it with its link.
+
+        Args:
+            title: Poll title.
+            poll_type: 'datePoll' to schedule a date, 'textPoll' for text answers.
+            description: Optional description shown above the options.
+            expire: Optional voting deadline as ISO 8601, e.g.
+                '2026-10-31T18:00'. Without an offset it is read in
+                timezone_name (or UTC if that is not given).
+            allow_maybe: Whether participants may answer 'maybe'.
+            access: 'private' (only invited participants, the default) or
+                'open' (every user of this Nextcloud can find and join it).
+            timezone_name: IANA timezone of the poll, e.g. 'Europe/Berlin'.
+                Date options are shown in it.
+
+        The poll starts without options: add them with
+        nc_polls_add_date_option or nc_polls_add_text_options. A private poll
+        is only visible to its owner until it is shared in the Polls app.
+        """
+        if not title.strip():
+            raise MCPError(code=-1, message="Failed creating poll: title is empty")
+        client = await get_client(ctx)
+        with _polls_errors("creating poll"):
+            if timezone_name is not None:
+                _validate_timezone(timezone_name)
+            tz = poll_timezone(timezone_name)
+            changes = _config_changes(
+                tz,
+                description=description,
+                expire=expire,
+                allow_maybe=allow_maybe,
+                access=access,
+            )
+            if timezone_name is not None:
+                changes["timezoneName"] = timezone_name
+            poll = await client.polls.create_poll(title, poll_type)
+            if changes:
+                poll = await client.polls.update_poll(poll["id"], changes)
+        return CreatePollResponse(poll=Poll.from_api(poll))
+
+    @mcp.tool(
+        title="Update Poll",
+        annotations=ToolAnnotations(idempotent_hint=True, open_world_hint=True),
+    )
+    @require_scopes("polls.write")
+    @with_links
+    @instrument_tool
+    async def nc_polls_update_poll(
+        poll_id: int,
+        ctx: Context,
+        title: str | None = None,
+        description: str | None = None,
+        expire: str | None = None,
+        remove_expire: bool = False,
+        allow_maybe: bool | None = None,
+        access: PollAccess | None = None,
+    ) -> UpdatePollResponse:
+        """Change the settings of a poll. Only the arguments given are changed.
+
+        Args:
+            poll_id: Poll to change.
+            title: New title.
+            description: New description.
+            expire: New voting deadline as ISO 8601. Without an offset it is
+                read in the poll's timezone.
+            remove_expire: True to remove the voting deadline.
+            allow_maybe: Whether participants may answer 'maybe'.
+            access: 'private' or 'open'.
+        """
+        client = await get_client(ctx)
+        with _polls_errors(f"updating poll {poll_id}"):
+            tz: ZoneInfo | timezone = timezone.utc
+            if expire is not None:
+                current = await client.polls.get_poll(poll_id)
+                tz = poll_timezone(
+                    (current.get("configuration") or {}).get("timezoneName")
+                )
+            changes = _config_changes(
+                tz,
+                title=title,
+                description=description,
+                expire=expire,
+                remove_expire=remove_expire,
+                allow_maybe=allow_maybe,
+                access=access,
+            )
+            if not changes:
+                raise ValueError("nothing to change, pass at least one setting")
+            poll = await client.polls.update_poll(poll_id, changes)
+        return UpdatePollResponse(poll=Poll.from_api(poll))
+
+    @mcp.tool(
+        title="Add Date Option to Poll",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("polls.write")
+    @with_links
+    @instrument_tool
+    async def nc_polls_add_date_option(
+        poll_id: int,
+        start: str,
+        ctx: Context,
+        end: str | None = None,
+        duration_minutes: int | None = None,
+    ) -> AddPollOptionsResponse:
+        """Add a date/time slot to a date poll.
+
+        Args:
+            poll_id: A poll of type 'datePoll'.
+            start: Start as ISO 8601, e.g. '2026-10-20T18:00'. Without an
+                offset it is read in the poll's timezone (UTC if it has none).
+            end: End as ISO 8601. Give end or duration_minutes, not both.
+                With neither, the slot is a point in time.
+            duration_minutes: Length of the slot in minutes.
+
+        The response shows the slot as stored, with an explicit offset, so it
+        can be checked against what was meant.
+        """
+        if end is not None and duration_minutes is not None:
+            raise MCPError(
+                code=-1,
+                message="Failed adding date option: pass end or duration_minutes, not both",
+            )
+        client = await get_client(ctx)
+        with _polls_errors(f"adding a date option to poll {poll_id}"):
+            poll = await client.polls.get_poll(poll_id)
+            if poll.get("type") != DATE_POLL:
+                raise ValueError(
+                    "poll is not a date poll, use nc_polls_add_text_options"
+                )
+            tz = poll_timezone((poll.get("configuration") or {}).get("timezoneName"))
+            begin = parse_poll_datetime(start, tz)
+            if end is not None:
+                duration = int((parse_poll_datetime(end, tz) - begin).total_seconds())
+            else:
+                duration = (duration_minutes or 0) * 60
+            if duration < 0:
+                raise ValueError("the slot ends before it starts")
+            option = await client.polls.add_option(
+                poll_id, int(begin.timestamp()), duration
+            )
+        return AddPollOptionsResponse(
+            poll_id=poll_id,
+            timezone_name=str(tz),
+            added=[PollOption.from_api(option, DATE_POLL, tz)],
+        )
+
+    @mcp.tool(
+        title="Add Text Options to Poll",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("polls.write")
+    @with_links
+    @instrument_tool
+    async def nc_polls_add_text_options(
+        poll_id: int, texts: list[str], ctx: Context
+    ) -> AddPollOptionsResponse:
+        """Add one or more text answers to a text poll in a single call.
+
+        Args:
+            poll_id: A poll of type 'textPoll'.
+            texts: The answers to add, one per entry. An entry must not be
+                empty or contain a line break.
+        """
+        cleaned = [t.strip() for t in texts]
+        if not cleaned or any(not t or "\n" in t or "\r" in t for t in cleaned):
+            raise MCPError(
+                code=-1,
+                message=(
+                    "Failed adding text options: pass at least one text, none "
+                    "empty and none containing a line break"
+                ),
+            )
+        client = await get_client(ctx)
+        with _polls_errors(f"adding text options to poll {poll_id}"):
+            poll, before, _ = await _poll_with_options(client, poll_id, votes=False)
+            if poll.get("type") != TEXT_POLL:
+                raise ValueError(
+                    "poll is not a text poll, use nc_polls_add_date_option"
+                )
+            known = {o.get("id") for o in before}
+            after = await client.polls.add_text_options(poll_id, cleaned)
+        tz = poll_timezone((poll.get("configuration") or {}).get("timezoneName"))
+        added = [
+            PollOption.from_api(o, TEXT_POLL, tz)
+            for o in after
+            if o.get("id") not in known and not o.get("deleted")
+        ]
+        return AddPollOptionsResponse(
+            poll_id=poll_id, timezone_name=str(tz), added=added
+        )
+
+    @mcp.tool(
+        title="Vote in Poll",
+        annotations=ToolAnnotations(idempotent_hint=True, open_world_hint=True),
+    )
+    @require_scopes("polls.write")
+    @with_links
+    @instrument_tool
+    async def nc_polls_vote(
+        poll_id: int, option_id: int, answer: VoteAnswer, ctx: Context
+    ) -> VoteResponse:
+        """Record the user's answer on one option of a poll.
+
+        Args:
+            poll_id: The poll the option belongs to.
+            option_id: Option to answer, from nc_polls_get_options.
+            answer: 'yes', 'maybe' (only if the poll allows it) or 'no'.
+
+        Voting again on the same option replaces the earlier answer.
+        """
+        client = await get_client(ctx)
+        with _polls_errors(f"voting on option {option_id} of poll {poll_id}"):
+            poll, options, _ = await _poll_with_options(client, poll_id, votes=False)
+            _find_option(options, option_id, poll_id)
+            config = poll.get("configuration") or {}
+            if answer == "maybe" and not config.get("allowMaybe", False):
+                raise ValueError("this poll does not allow 'maybe' answers")
+            vote = await client.polls.vote(option_id, answer)
+        recorded = (vote or {}).get("answer") or answer
+        return VoteResponse(poll_id=poll_id, option_id=option_id, answer=recorded)
+
+    @mcp.tool(
+        title="Comment on Poll",
+        annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True),
+    )
+    @require_scopes("polls.write")
+    @with_links
+    @instrument_tool
+    async def nc_polls_add_comment(
+        poll_id: int, comment: str, ctx: Context, confidential: bool = False
+    ) -> AddPollCommentResponse:
+        """Add a comment to a poll, visible to its participants.
+
+        Args:
+            poll_id: Poll to comment on.
+            comment: Comment text.
+            confidential: True to make the comment visible only to the poll
+                owner and the author.
+        """
+        if not comment.strip():
+            raise MCPError(code=-1, message="Failed adding comment: comment is empty")
+        if len(comment) > _COMMENT_MAX_LENGTH:
+            raise MCPError(
+                code=-1,
+                message=(
+                    f"Failed adding comment: {len(comment)} characters "
+                    f"(max {_COMMENT_MAX_LENGTH})"
+                ),
+            )
+        client = await get_client(ctx)
+        with _polls_errors(f"commenting on poll {poll_id}"):
+            data = await client.polls.add_comment(poll_id, comment, confidential)
+        return AddPollCommentResponse(
+            poll_id=poll_id, comment=PollComment.from_api(data)
+        )
+
+    @mcp.tool(
+        title="Confirm Poll Option",
+        annotations=ToolAnnotations(idempotent_hint=True, open_world_hint=True),
+    )
+    @require_scopes("polls.write")
+    @with_links
+    @instrument_tool
+    async def nc_polls_confirm_option(
+        poll_id: int, option_id: int, ctx: Context, confirmed: bool = True
+    ) -> ConfirmPollOptionResponse:
+        """Mark an option as the confirmed outcome of a poll, or unmark it.
+
+        Typically used by the poll owner after closing a date poll to fix the
+        chosen date. Several options may be confirmed.
+
+        Args:
+            poll_id: The poll the option belongs to.
+            option_id: Option to confirm, from nc_polls_get_options.
+            confirmed: True to confirm, False to withdraw the confirmation.
+        """
+        client = await get_client(ctx)
+        with _polls_errors(f"confirming option {option_id} of poll {poll_id}"):
+            poll, options, _ = await _poll_with_options(client, poll_id, votes=False)
+            option = _find_option(options, option_id, poll_id)
+            # Polls only offers a toggle; read the state first so calling this
+            # twice with the same argument leaves the option as asked.
+            changed = bool(option.get("confirmed")) != confirmed
+            if changed:
+                option = await client.polls.toggle_option_confirmation(option_id)
+        poll_type = poll.get("type", "")
+        tz = poll_timezone((poll.get("configuration") or {}).get("timezoneName"))
+        return ConfirmPollOptionResponse(
+            poll_id=poll_id,
+            option=PollOption.from_api(option, poll_type, tz),
+            changed=changed,
+        )
+
+    @mcp.tool(
+        title="Close Poll",
+        annotations=ToolAnnotations(idempotent_hint=True, open_world_hint=True),
+    )
+    @require_scopes("polls.write")
+    @with_links
+    @instrument_tool
+    async def nc_polls_close_poll(poll_id: int, ctx: Context) -> UpdatePollResponse:
+        """Close a poll so no further votes can be cast. Reversible with
+        nc_polls_reopen_poll."""
+        client = await get_client(ctx)
+        with _polls_errors(f"closing poll {poll_id}"):
+            poll = await client.polls.close_poll(poll_id)
+        return UpdatePollResponse(poll=Poll.from_api(poll))
+
+    @mcp.tool(
+        title="Reopen Poll",
+        annotations=ToolAnnotations(idempotent_hint=True, open_world_hint=True),
+    )
+    @require_scopes("polls.write")
+    @with_links
+    @instrument_tool
+    async def nc_polls_reopen_poll(poll_id: int, ctx: Context) -> UpdatePollResponse:
+        """Reopen a closed poll for voting.
+
+        Polls closes a poll by moving its deadline to the moment of closing, so
+        check the deadline in the returned poll and set a new one with
+        nc_polls_update_poll if needed.
+        """
+        client = await get_client(ctx)
+        with _polls_errors(f"reopening poll {poll_id}"):
+            poll = await client.polls.reopen_poll(poll_id)
+        return UpdatePollResponse(poll=Poll.from_api(poll))

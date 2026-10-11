@@ -6,7 +6,7 @@ model reading a tool result does not have to know Polls' conventions.
 """
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field
@@ -18,6 +18,23 @@ from .base import BaseResponse
 DATE_POLL = "datePoll"
 TEXT_POLL = "textPoll"
 
+#: Poll types and answers as ``Literal``s, so an unsupported value is rejected by
+#: the schema -- and appears as an enum in the MCP tool definition -- instead of
+#: reaching Polls.
+PollType = Literal["datePoll", "textPoll"]
+PollAccess = Literal["private", "open"]
+VoteAnswer = Literal["yes", "maybe", "no"]
+
+POLL_URL_DESCRIPTION = (
+    "Link that opens this poll in the Nextcloud Polls app. Offer it to the user "
+    "when referring to the poll so they can view it or vote. None when the "
+    "server has no browser-reachable Nextcloud base URL configured."
+)
+
+
+def _url_field() -> Any:
+    return Field(default=None, description=POLL_URL_DESCRIPTION)
+
 
 def poll_timezone(name: str | None) -> ZoneInfo | timezone:
     """The poll's timezone, falling back to UTC for a missing or unknown name."""
@@ -27,6 +44,23 @@ def poll_timezone(name: str | None) -> ZoneInfo | timezone:
         except (ZoneInfoNotFoundError, ValueError):
             pass
     return timezone.utc
+
+
+def parse_poll_datetime(value: str, tz: ZoneInfo | timezone) -> datetime:
+    """Parse an ISO 8601 date-time; one without an offset is read in ``tz``.
+
+    Raises:
+        ValueError: if ``value`` is not an ISO 8601 date-time.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as e:
+        raise ValueError(
+            f"expected an ISO 8601 date-time such as 2026-10-20T18:00, got {value!r}"
+        ) from e
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=tz)
+    return parsed
 
 
 def from_unix(value: Any, tz: ZoneInfo | timezone = timezone.utc) -> datetime | None:
@@ -71,6 +105,7 @@ class PollSummary(BaseModel):
     is_archived: bool = Field(default=False, description="Poll is archived")
     is_expired: bool = Field(default=False, description="Voting deadline has passed")
     owner: PollOwner = Field(description="Owner of the poll")
+    url: str | None = _url_field()
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> "PollSummary":
@@ -181,6 +216,7 @@ class Poll(BaseModel):
     configuration: PollConfiguration = Field(description="Poll settings")
     owner: PollOwner = Field(description="Owner of the poll")
     status: PollStatus = Field(description="Lifecycle state of the poll")
+    url: str | None = _url_field()
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> "Poll":
@@ -275,6 +311,30 @@ class PollOptionResult(BaseModel):
     no_voters: list[str] = Field(description="Names of those who voted 'no'")
 
 
+class PollComment(BaseModel):
+    """A comment on a poll."""
+
+    id: int = Field(description="Comment ID")
+    author: str = Field(description="Display name of the author")
+    created: datetime | None = Field(default=None, description="Time written (UTC)")
+    comment: str = Field(description="Comment text")
+    confidential: bool = Field(
+        default=False,
+        description="Only visible to the poll owner and the author",
+    )
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> "PollComment":
+        user = data.get("user") or {}
+        return cls(
+            id=data["id"],
+            author=user.get("displayName") or user.get("userId") or "?",
+            created=from_unix(data.get("timestamp")),
+            comment=data.get("comment") or "",
+            confidential=bool(data.get("confidential")),
+        )
+
+
 def _voter_name(vote: dict[str, Any]) -> str:
     user = vote.get("user") or {}
     return user.get("displayName") or user.get("userId") or user.get("id") or "?"
@@ -363,6 +423,7 @@ class ListPollOptionsResponse(BaseResponse):
     )
     results: list[PollOption] = Field(description="Options in poll order")
     total: int = Field(description="Number of options returned")
+    url: str | None = _url_field()
 
 
 class PollResultsResponse(BaseResponse):
@@ -381,3 +442,64 @@ class PollResultsResponse(BaseResponse):
         description="Options sorted by approval: most 'yes', then most 'maybe'"
     )
     total: int = Field(description="Number of options returned")
+    url: str | None = _url_field()
+
+
+class ListPollCommentsResponse(BaseResponse):
+    """Response model for listing a poll's comments."""
+
+    poll_id: int = Field(description="Poll ID")
+    results: list[PollComment] = Field(description="Comments, oldest first")
+    total: int = Field(description="Number of comments returned")
+    url: str | None = _url_field()
+
+
+class CreatePollResponse(BaseResponse):
+    """Response model returned after creating a poll."""
+
+    poll: Poll = Field(description="The created poll")
+
+
+class UpdatePollResponse(BaseResponse):
+    """Response model returned after changing a poll's settings or state."""
+
+    poll: Poll = Field(description="The poll after the change")
+
+
+class AddPollOptionsResponse(BaseResponse):
+    """Response model returned after adding options to a poll."""
+
+    poll_id: int = Field(description="Poll ID")
+    timezone_name: str = Field(
+        description="Timezone the option start/end times are expressed in"
+    )
+    added: list[PollOption] = Field(description="The options that were added")
+    url: str | None = _url_field()
+
+
+class VoteResponse(BaseResponse):
+    """Response model returned after voting on an option."""
+
+    poll_id: int = Field(description="Poll ID")
+    option_id: int = Field(description="Option voted on")
+    answer: str = Field(description="The answer now recorded: yes, maybe or no")
+    url: str | None = _url_field()
+
+
+class AddPollCommentResponse(BaseResponse):
+    """Response model returned after commenting on a poll."""
+
+    poll_id: int = Field(description="Poll ID")
+    comment: PollComment = Field(description="The added comment")
+    url: str | None = _url_field()
+
+
+class ConfirmPollOptionResponse(BaseResponse):
+    """Response model returned after setting an option's confirmed state."""
+
+    poll_id: int = Field(description="Poll ID")
+    option: PollOption = Field(description="The option after the change")
+    changed: bool = Field(
+        description="False when the option already had the requested state"
+    )
+    url: str | None = _url_field()
