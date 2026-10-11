@@ -26,6 +26,7 @@ from .mail import MailClient
 from .news import NewsClient
 from .notes import NotesClient
 from .ocs import OCS_REQUEST_HEADERS
+from .polls import PollsClient
 from .sharing import SharingClient
 from .shopping_list import ShoppingListClient
 from .tables import TablesClient
@@ -196,6 +197,7 @@ class NextcloudClient:
         self.groups = GroupsClient(self._client, username)
         self.sharing = SharingClient(self._client, username)
         self.shopping_list = ShoppingListClient(self._client, username)
+        self.polls = PollsClient(self._client, username)
 
         # Initialize controllers
         self._notes_search = NotesSearchController()
