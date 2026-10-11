@@ -1,13 +1,16 @@
 """Polls MCP tools, called directly against a stubbed client.
 
 The client and models are covered in ``tests/client/polls``; these pin what the
-tools add on top: the typed responses, the timezone they report, and that an
-HTTP failure reaches the model as an ``MCPError`` naming the cause.
+tools add on top: the typed responses, the timezone they report, what the write
+tools send to Polls (and what they refuse to send), the link to the poll, and
+that an HTTP failure reaches the model as an ``MCPError`` naming the cause.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import datetime
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -16,6 +19,7 @@ from mcp.shared.exceptions import MCPError
 
 from nextcloud_mcp_server.server.polls import configure_polls_tools
 from tests.client.polls.test_polls_api import (
+    BERLIN,
     POLL_FIXTURE,
     SLOT_SUMMER,
     SLOT_WINTER,
@@ -76,6 +80,7 @@ async def _call(polls_tools, mocker, name, **kwargs):
 
 
 async def test_list_polls(polls_tools, stub_client, mocker):
+    """The list maps each poll and turns a 0 deadline into None."""
     result = await _call(polls_tools, mocker, "nc_polls_list_polls")
 
     assert result.total == 2
@@ -84,6 +89,7 @@ async def test_list_polls(polls_tools, stub_client, mocker):
 
 
 async def test_get_poll(polls_tools, stub_client, mocker):
+    """A single poll comes back with its configuration."""
     result = await _call(polls_tools, mocker, "nc_polls_get_poll", poll_id=7)
 
     assert result.poll.id == 7
@@ -92,16 +98,18 @@ async def test_get_poll(polls_tools, stub_client, mocker):
 
 
 async def test_get_options_in_poll_order_and_timezone(polls_tools, stub_client, mocker):
+    """Options sort by poll order, deleted ones drop, times are local."""
     result = await _call(polls_tools, mocker, "nc_polls_get_options", poll_id=7)
 
     assert result.timezone_name == "Europe/Berlin"
     assert result.poll_type == "datePoll"
-    assert [o.id for o in result.results] == [1, 2]  # deleted option dropped
+    assert [o.id for o in result.results] == [1, 2]
     assert result.results[0].start.isoformat() == "2026-10-20T18:00:00+02:00"
     assert result.results[0].end.isoformat() == "2026-10-20T20:00:00+02:00"
 
 
 async def test_get_results_sorted_by_approval(polls_tools, stub_client, mocker):
+    """The tally lists the most-approved option first."""
     result = await _call(polls_tools, mocker, "nc_polls_get_results", poll_id=7)
 
     assert result.title == "Vorstandssitzung"
@@ -127,17 +135,427 @@ async def test_results_use_one_request_when_details_carry_everything(
     stub_client.polls.get_votes.assert_not_awaited()
 
 
+def _comment(comment_id, text, timestamp, deleted=0):
+    return {
+        "id": comment_id,
+        "pollId": 7,
+        "timestamp": timestamp,
+        "comment": text,
+        "confidential": 0,
+        "parent": 0,
+        "deleted": deleted,
+        "user": {"id": "alice", "userId": "alice", "displayName": "Alice"},
+        "recipient": None,
+    }
+
+
+async def test_get_comments_oldest_first_without_deleted(
+    polls_tools, stub_client, mocker
+):
+    """Comments sort by time and deleted ones are left out."""
+    stub_client.polls.get_comments = mocker.AsyncMock(
+        return_value=[
+            _comment(2, "später", 1790000200),
+            _comment(1, "zuerst", 1790000100),
+            _comment(3, "weg", 1790000300, deleted=1790000400),
+        ]
+    )
+
+    result = await _call(polls_tools, mocker, "nc_polls_get_comments", poll_id=7)
+
+    assert [c.comment for c in result.results] == ["zuerst", "später"]
+    assert result.results[0].author == "Alice"
+    assert result.total == 2
+
+
+# --- Write tools ---
+
+
+async def test_create_poll_with_settings(polls_tools, stub_client, mocker):
+    """Settings beyond title and type go out in one follow-up update."""
+    created = {**POLL_FIXTURE, "id": 9}
+    stub_client.polls.create_poll = mocker.AsyncMock(return_value=created)
+    stub_client.polls.update_poll = mocker.AsyncMock(return_value=created)
+
+    result = await _call(
+        polls_tools,
+        mocker,
+        "nc_polls_create_poll",
+        title="Vorstandssitzung",
+        poll_type="datePoll",
+        description="Bitte abstimmen",
+        expire="2026-10-31T18:00",
+        allow_maybe=True,
+        access="open",
+        timezone_name="Europe/Berlin",
+    )
+
+    assert result.poll.id == 9
+    stub_client.polls.create_poll.assert_awaited_once_with(
+        "Vorstandssitzung", "datePoll"
+    )
+    stub_client.polls.update_poll.assert_awaited_once_with(
+        9,
+        {
+            "description": "Bitte abstimmen",
+            "expire": int(datetime(2026, 10, 31, 18, 0, tzinfo=BERLIN).timestamp()),
+            "allowMaybe": True,
+            "access": "open",
+            "timezoneName": "Europe/Berlin",
+        },
+    )
+
+
+async def test_create_poll_without_settings_skips_the_update(
+    polls_tools, stub_client, mocker
+):
+    """Title and type alone need no second request."""
+    stub_client.polls.create_poll = mocker.AsyncMock(return_value=TEXT_POLL_FIXTURE)
+    stub_client.polls.update_poll = mocker.AsyncMock()
+
+    await _call(
+        polls_tools, mocker, "nc_polls_create_poll", title="Ort", poll_type="textPoll"
+    )
+
+    stub_client.polls.update_poll.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"title": "  "}, "title is empty"),
+        ({"title": "T", "timezone_name": "Mars/Base"}, "unknown timezone"),
+        ({"title": "T", "expire": "next friday"}, "ISO 8601"),
+    ],
+)
+async def test_create_poll_rejects_bad_input_before_creating(
+    polls_tools, stub_client, mocker, kwargs, message
+):
+    """Invalid input never leaves a half-configured poll behind."""
+    stub_client.polls.create_poll = mocker.AsyncMock()
+
+    with pytest.raises(MCPError, match=re.escape(message)):
+        await _call(
+            polls_tools, mocker, "nc_polls_create_poll", poll_type="datePoll", **kwargs
+        )
+
+    stub_client.polls.create_poll.assert_not_awaited()
+
+
+async def test_update_poll_sends_only_given_settings(polls_tools, stub_client, mocker):
+    """Untouched settings are not sent, so they keep their value."""
+    stub_client.polls.update_poll = mocker.AsyncMock(return_value=POLL_FIXTURE)
+
+    await _call(
+        polls_tools,
+        mocker,
+        "nc_polls_update_poll",
+        poll_id=7,
+        title="Neu",
+        remove_expire=True,
+    )
+
+    stub_client.polls.update_poll.assert_awaited_once_with(
+        7, {"title": "Neu", "expire": 0}
+    )
+
+
+async def test_update_poll_reads_expire_in_the_polls_timezone(
+    polls_tools, stub_client, mocker
+):
+    """A deadline without offset means local time of the poll."""
+    stub_client.polls.update_poll = mocker.AsyncMock(return_value=POLL_FIXTURE)
+
+    await _call(
+        polls_tools,
+        mocker,
+        "nc_polls_update_poll",
+        poll_id=7,
+        expire="2026-12-01T12:00",
+    )
+
+    sent = stub_client.polls.update_poll.await_args.args[1]
+    assert sent == {
+        "expire": int(datetime(2026, 12, 1, 12, 0, tzinfo=BERLIN).timestamp())
+    }
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({}, "nothing to change"),
+        ({"expire": "2026-12-01T12:00", "remove_expire": True}, "not both"),
+    ],
+)
+async def test_update_poll_rejects_empty_or_conflicting_changes(
+    polls_tools, stub_client, mocker, kwargs, message
+):
+    """No request goes out for an update that cannot mean anything."""
+    stub_client.polls.update_poll = mocker.AsyncMock()
+
+    with pytest.raises(MCPError, match=message):
+        await _call(polls_tools, mocker, "nc_polls_update_poll", poll_id=7, **kwargs)
+
+    stub_client.polls.update_poll.assert_not_awaited()
+
+
+async def test_add_date_option_local_time_and_duration(
+    polls_tools, stub_client, mocker
+):
+    """Start without offset is local to the poll; end becomes a duration."""
+    stub_client.polls.add_option = mocker.AsyncMock(
+        return_value=_option(5, SLOT_SUMMER, 3, duration=5400)
+    )
+
+    result = await _call(
+        polls_tools,
+        mocker,
+        "nc_polls_add_date_option",
+        poll_id=7,
+        start="2026-10-20T18:00",
+        end="2026-10-20T19:30",
+    )
+
+    stub_client.polls.add_option.assert_awaited_once_with(7, SLOT_SUMMER, 5400)
+    assert result.added[0].start.isoformat() == "2026-10-20T18:00:00+02:00"
+    assert result.added[0].end.isoformat() == "2026-10-20T19:30:00+02:00"
+
+
+async def test_add_date_option_explicit_offset_wins(polls_tools, stub_client, mocker):
+    """An offset in the input is honoured rather than the poll's timezone."""
+    stub_client.polls.add_option = mocker.AsyncMock(
+        return_value=_option(5, SLOT_SUMMER, 3, duration=3600)
+    )
+
+    await _call(
+        polls_tools,
+        mocker,
+        "nc_polls_add_date_option",
+        poll_id=7,
+        start="2026-10-20T16:00:00+00:00",
+        duration_minutes=60,
+    )
+
+    stub_client.polls.add_option.assert_awaited_once_with(7, SLOT_SUMMER, 3600)
+
+
+@pytest.mark.parametrize(
+    ("poll", "kwargs", "message"),
+    [
+        (
+            POLL_FIXTURE,
+            {"start": "2026-10-20T18:00", "end": "2026-10-20T17:00"},
+            "ends before it starts",
+        ),
+        (
+            POLL_FIXTURE,
+            {
+                "start": "2026-10-20T18:00",
+                "end": "2026-10-20T19:00",
+                "duration_minutes": 60,
+            },
+            "not both",
+        ),
+        (TEXT_POLL_FIXTURE, {"start": "2026-10-20T18:00"}, "not a date poll"),
+    ],
+)
+async def test_add_date_option_rejects_bad_input(
+    polls_tools, stub_client, mocker, poll, kwargs, message
+):
+    """Nothing is added when the slot or the poll type is wrong."""
+    stub_client.polls.get_poll.return_value = poll
+    stub_client.polls.add_option = mocker.AsyncMock()
+
+    with pytest.raises(MCPError, match=message):
+        await _call(
+            polls_tools, mocker, "nc_polls_add_date_option", poll_id=7, **kwargs
+        )
+
+    stub_client.polls.add_option.assert_not_awaited()
+
+
+async def test_add_text_options_returns_only_the_new_ones(
+    polls_tools, stub_client, mocker
+):
+    """The route answers with every option; the tool reports what it added."""
+    existing = _option(1, 0, 1, text="Berlin")
+    stub_client.polls.get_poll_details.return_value = {
+        "poll": TEXT_POLL_FIXTURE,
+        "options": [existing],
+    }
+    stub_client.polls.add_text_options = mocker.AsyncMock(
+        return_value=[
+            existing,
+            _option(2, 0, 2, text="Hamburg"),
+            _option(3, 0, 3, text="Köln"),
+        ]
+    )
+
+    result = await _call(
+        polls_tools,
+        mocker,
+        "nc_polls_add_text_options",
+        poll_id=8,
+        texts=[" Hamburg ", "Köln"],
+    )
+
+    stub_client.polls.add_text_options.assert_awaited_once_with(8, ["Hamburg", "Köln"])
+    assert [o.text for o in result.added] == ["Hamburg", "Köln"]
+    assert result.added[0].start is None
+
+
+@pytest.mark.parametrize("texts", [[], [""], ["a\nb"]])
+async def test_add_text_options_rejects_bad_texts(
+    polls_tools, stub_client, mocker, texts
+):
+    """Empty entries or line breaks would split or blank options."""
+    stub_client.polls.add_text_options = mocker.AsyncMock()
+
+    with pytest.raises(MCPError, match="line break"):
+        await _call(
+            polls_tools, mocker, "nc_polls_add_text_options", poll_id=8, texts=texts
+        )
+
+    stub_client.polls.add_text_options.assert_not_awaited()
+
+
+async def test_vote(polls_tools, stub_client, mocker):
+    """A vote on an option of the poll is passed through."""
+    stub_client.polls.vote = mocker.AsyncMock(
+        return_value=_vote(2, "maybe", "alice", "Alice")
+    )
+
+    result = await _call(
+        polls_tools, mocker, "nc_polls_vote", poll_id=7, option_id=2, answer="maybe"
+    )
+
+    stub_client.polls.vote.assert_awaited_once_with(2, "maybe")
+    assert (result.poll_id, result.option_id, result.answer) == (7, 2, "maybe")
+
+
+@pytest.mark.parametrize(
+    ("option_id", "answer", "poll", "message"),
+    [
+        (99, "yes", POLL_FIXTURE, "not an option of poll 7"),
+        (3, "yes", POLL_FIXTURE, "not an option of poll 7"),  # deleted option
+        (2, "maybe", {**POLL_FIXTURE, "configuration": {"allowMaybe": False}}, "maybe"),
+    ],
+)
+async def test_vote_refuses_what_polls_would_reject(
+    polls_tools, stub_client, mocker, option_id, answer, poll, message
+):
+    """Wrong option or a disallowed 'maybe' never reaches the vote route."""
+    stub_client.polls.get_poll_details.return_value = {"poll": poll}
+    stub_client.polls.vote = mocker.AsyncMock()
+
+    with pytest.raises(MCPError, match=message):
+        await _call(
+            polls_tools,
+            mocker,
+            "nc_polls_vote",
+            poll_id=7,
+            option_id=option_id,
+            answer=answer,
+        )
+
+    stub_client.polls.vote.assert_not_awaited()
+
+
+async def test_add_comment(polls_tools, stub_client, mocker):
+    """A comment is posted and returned."""
+    stub_client.polls.add_comment = mocker.AsyncMock(
+        return_value=_comment(4, "Passt mir", 1790000500)
+    )
+
+    result = await _call(
+        polls_tools, mocker, "nc_polls_add_comment", poll_id=7, comment="Passt mir"
+    )
+
+    stub_client.polls.add_comment.assert_awaited_once_with(7, "Passt mir", False)
+    assert result.comment.comment == "Passt mir"
+
+
+@pytest.mark.parametrize(("comment", "message"), [("  ", "empty"), ("x" * 4001, "max")])
+async def test_add_comment_rejects_empty_or_overlong(
+    polls_tools, stub_client, mocker, comment, message
+):
+    """Blank or runaway comments are refused before posting."""
+    stub_client.polls.add_comment = mocker.AsyncMock()
+
+    with pytest.raises(MCPError, match=message):
+        await _call(
+            polls_tools, mocker, "nc_polls_add_comment", poll_id=7, comment=comment
+        )
+
+    stub_client.polls.add_comment.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("current", "requested", "toggled"),
+    [
+        (0, True, True),
+        (1790000000, True, False),
+        (1790000000, False, True),
+        (0, False, False),
+    ],
+)
+async def test_confirm_option_only_toggles_when_needed(
+    polls_tools, stub_client, mocker, current, requested, toggled
+):
+    """The route is a toggle; the tool turns it into a setter."""
+    option = {**_option(1, SLOT_SUMMER, 1), "confirmed": current}
+    stub_client.polls.get_poll_details.return_value = {
+        "poll": POLL_FIXTURE,
+        "options": [option],
+    }
+    flipped = {**option, "confirmed": 0 if current else 1790000600}
+    stub_client.polls.toggle_option_confirmation = mocker.AsyncMock(
+        return_value=flipped
+    )
+
+    result = await _call(
+        polls_tools,
+        mocker,
+        "nc_polls_confirm_option",
+        poll_id=7,
+        option_id=1,
+        confirmed=requested,
+    )
+
+    assert result.changed is toggled
+    assert result.option.confirmed is requested
+    assert stub_client.polls.toggle_option_confirmation.await_count == int(toggled)
+
+
+@pytest.mark.parametrize(
+    ("tool", "method"),
+    [("nc_polls_close_poll", "close_poll"), ("nc_polls_reopen_poll", "reopen_poll")],
+)
+async def test_close_and_reopen(polls_tools, stub_client, mocker, tool, method):
+    """Closing and reopening return the poll in its new state."""
+    setattr(stub_client.polls, method, mocker.AsyncMock(return_value=POLL_FIXTURE))
+
+    result = await _call(polls_tools, mocker, tool, poll_id=7)
+
+    getattr(stub_client.polls, method).assert_awaited_once_with(7)
+    assert result.poll.id == 7
+
+
+# --- Errors, links, annotations ---
+
+
 @pytest.mark.parametrize(
     ("status", "detail"),
     [
-        (404, "poll not found, or not shared with you"),
-        (403, "you do not have access to this poll"),
+        (404, "not found, or not shared with you"),
+        (403, "not allowed"),
         (500, "server error (500)"),
     ],
 )
 async def test_http_errors_become_mcp_errors(
     polls_tools, stub_client, mocker, status, detail
 ):
+    """Each failure class reaches the model with a reason it can act on."""
     request = httpx.Request("GET", "https://nc.example/ocs/v2.php/apps/polls")
     stub_client.polls.get_poll.side_effect = httpx.HTTPStatusError(
         "boom", request=request, response=httpx.Response(status, request=request)
@@ -147,16 +565,98 @@ async def test_http_errors_become_mcp_errors(
         await _call(polls_tools, mocker, "nc_polls_get_poll", poll_id=99)
 
 
-def test_all_tools_are_read_only(polls_tools):
+async def test_server_reason_is_passed_on(polls_tools, stub_client, mocker):
+    """When Polls says why it refused, the model sees that reason."""
+    request = httpx.Request("PUT", "https://nc.example/ocs/v2.php/apps/polls")
+    response = httpx.Response(
+        403,
+        request=request,
+        json={
+            "ocs": {
+                "meta": {"statuscode": 403, "message": "Poll is closed"},
+                "data": [],
+            }
+        },
+    )
+    stub_client.polls.close_poll = mocker.AsyncMock(
+        side_effect=httpx.HTTPStatusError("boom", request=request, response=response)
+    )
+
+    with pytest.raises(MCPError, match="Poll is closed"):
+        await _call(polls_tools, mocker, "nc_polls_close_poll", poll_id=7)
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "url_of"),
+    [
+        ("nc_polls_list_polls", {}, lambda r: r.results[0].url),
+        ("nc_polls_get_poll", {"poll_id": 7}, lambda r: r.poll.url),
+        ("nc_polls_get_options", {"poll_id": 7}, lambda r: r.url),
+        ("nc_polls_get_results", {"poll_id": 7}, lambda r: r.url),
+    ],
+)
+async def test_responses_link_to_the_poll(
+    polls_tools, stub_client, mocker, tool, kwargs, url_of
+):
+    """Every response carries a link that opens the poll in the browser."""
+    mocker.patch(
+        "nextcloud_mcp_server.astrolabe_links.get_settings",
+        return_value=SimpleNamespace(nextcloud_browser_url="https://nc.example.com"),
+    )
+
+    result = await _call(polls_tools, mocker, tool, **kwargs)
+
+    assert url_of(result) == "https://nc.example.com/index.php/apps/polls/vote/7"
+
+
+async def test_vote_response_links_to_the_poll(polls_tools, stub_client, mocker):
+    """Write responses are linked too, from the poll id they carry."""
+    mocker.patch(
+        "nextcloud_mcp_server.astrolabe_links.get_settings",
+        return_value=SimpleNamespace(nextcloud_browser_url="https://nc.example.com"),
+    )
+    stub_client.polls.vote = mocker.AsyncMock(return_value=None)
+
+    result = await _call(
+        polls_tools, mocker, "nc_polls_vote", poll_id=7, option_id=1, answer="yes"
+    )
+
+    assert result.url == "https://nc.example.com/index.php/apps/polls/vote/7"
+    assert result.answer == "yes"
+
+
+READ_TOOLS = {
+    "nc_polls_list_polls",
+    "nc_polls_get_poll",
+    "nc_polls_get_options",
+    "nc_polls_get_results",
+    "nc_polls_get_comments",
+}
+WRITE_TOOLS = {
+    "nc_polls_create_poll": False,
+    "nc_polls_update_poll": True,
+    "nc_polls_add_date_option": False,
+    "nc_polls_add_text_options": False,
+    "nc_polls_vote": True,
+    "nc_polls_add_comment": False,
+    "nc_polls_confirm_option": True,
+    "nc_polls_close_poll": True,
+    "nc_polls_reopen_poll": True,
+}
+
+
+def test_tool_set_and_annotations(polls_tools):
+    """Read tools are read-only; write tools are non-destructive, with the
+    idempotency ADR-017 asks for. Nothing deletes."""
     tools = {t.name: t for t in polls_tools.list_tools()}
 
-    assert set(tools) == {
-        "nc_polls_list_polls",
-        "nc_polls_get_poll",
-        "nc_polls_get_options",
-        "nc_polls_get_results",
-    }
-    for tool in tools.values():
-        assert tool.annotations.read_only_hint is True
-        assert tool.annotations.open_world_hint is True
+    assert set(tools) == READ_TOOLS | set(WRITE_TOOLS)
+    for name, tool in tools.items():
         assert tool.title
+        assert tool.annotations.open_world_hint is True
+        assert tool.annotations.destructive_hint is not True
+        if name in READ_TOOLS:
+            assert tool.annotations.read_only_hint is True
+        else:
+            assert tool.annotations.read_only_hint is not True
+            assert tool.annotations.idempotent_hint is WRITE_TOOLS[name], name

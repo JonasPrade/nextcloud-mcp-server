@@ -41,6 +41,17 @@ from nextcloud_mcp_server.models.notes import (
     NoteSearchResult,
     UpdateNoteResponse,
 )
+from nextcloud_mcp_server.models.polls import (
+    AddPollCommentResponse,
+    AddPollOptionsResponse,
+    ConfirmPollOptionResponse,
+    ListPollCommentsResponse,
+    ListPollOptionsResponse,
+    Poll,
+    PollResultsResponse,
+    PollSummary,
+    VoteResponse,
+)
 from nextcloud_mcp_server.models.webdav import FileInfo
 
 logger = logging.getLogger(__name__)
@@ -53,6 +64,7 @@ _FILE_PATH = "/index.php/f/{file_id}"
 _BOARD_PATH = "/index.php/apps/deck/board/{board_id}"
 _CARD_PATH = "/index.php/apps/deck/board/{board_id}/card/{card_id}"
 _DECK_FILE_PATH = "/index.php/apps/deck/cards/{card_id}/attachment/{attachment_id}"
+_POLL_PATH = "/index.php/apps/polls/vote/{poll_id}"
 
 
 def _note_url(base: str, item: Any, ctx: dict[str, Any]) -> str | None:
@@ -111,6 +123,16 @@ def _card_operation_url(base: str, item: Any, ctx: dict[str, Any]) -> str | None
     return base + _CARD_PATH.format(board_id=item.board_id, card_id=item.card_id)
 
 
+def _poll_url(base: str, item: Any, ctx: dict[str, Any]) -> str | None:
+    return base + _POLL_PATH.format(poll_id=item.id)
+
+
+def _poll_response_url(base: str, item: Any, ctx: dict[str, Any]) -> str | None:
+    # Responses about one poll's parts (options, votes, comments) carry its id
+    # as ``poll_id`` and link to the poll itself; Polls has no deeper routes.
+    return base + _POLL_PATH.format(poll_id=item.poll_id)
+
+
 #: Item model -> the function that builds its browser URL. Every model listed
 #: here must declare a ``url`` field; ``test_links.py`` asserts that, because a
 #: registry entry whose model lacks the field would silently produce no link.
@@ -133,6 +155,15 @@ _URL_BUILDERS: dict[
     DeckCardSummary: _card_url,
     CreateCardResponse: _card_url,
     CardOperationResponse: _card_operation_url,
+    PollSummary: _poll_url,
+    Poll: _poll_url,
+    ListPollOptionsResponse: _poll_response_url,
+    PollResultsResponse: _poll_response_url,
+    ListPollCommentsResponse: _poll_response_url,
+    AddPollOptionsResponse: _poll_response_url,
+    VoteResponse: _poll_response_url,
+    AddPollCommentResponse: _poll_response_url,
+    ConfirmPollOptionResponse: _poll_response_url,
 }
 
 
