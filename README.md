@@ -139,6 +139,7 @@ For result *ordering* — turning the fused rank score into a calibrated relevan
 
 ## Documentation
 
+- **[Getting Started](docs/user-guide/getting-started.md)** — features, how login works, first steps
 - **[Installation](docs/installation.md)** — Docker, Compose profiles, local, VM
 - **[Configuration](docs/configuration.md)** — Environment variables, document processing, semantic search setup
 - **[Authentication](docs/authentication.md)** — Basic Auth, Login Flow v2
