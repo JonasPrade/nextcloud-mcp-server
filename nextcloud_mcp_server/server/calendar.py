@@ -18,6 +18,7 @@ from nextcloud_mcp_server.models.calendar import (
     CompleteTodoResponse,
     DeleteEventResponse,
     DeleteTodoResponse,
+    EventWriteResponse,
     FindAvailabilityResponse,
     ListCalendarsResponse,
     ListEventsResponse,
@@ -51,6 +52,57 @@ def _stale_etag_error(uid: str, e: DavPreconditionFailed) -> ToolError:
         "since you read it. Re-read the todo with nc_calendar_list_todos to "
         "get its current etag, re-apply your changes on top of that copy, and "
         "retry."
+    )
+
+
+def _stale_event_etag_error(
+    uid: str, e: DavPreconditionFailed, current: dict[str, Any] | None
+) -> ToolError:
+    """Turn a 412 on an event into an error that carries the current state.
+
+    The caller's ETag is stale, so the write was refused and nothing changed.
+    Showing what the event looks like *now* lets the caller decide whether its
+    change still applies, instead of having to re-read blindly.
+    """
+    detail = e.dav_message or "it was modified after that ETag was read"
+    logger.debug("Stale ETag on event %s: %s", uid, detail)
+    message = (
+        f"Event {uid} was not updated: {detail}. Another client changed it "
+        "since you read it, and nothing was written."
+    )
+    if current:
+        shown = {
+            k: current[k]
+            for k in (
+                "title",
+                "start_datetime",
+                "end_datetime",
+                "all_day",
+                "location",
+                "categories",
+                "url",
+                "etag",
+            )
+            if current.get(k) not in (None, "")
+        }
+        message += f" Current state: {shown}."
+    message += (
+        " Re-apply your change on top of that state and retry with the current "
+        "etag (nc_calendar_get_event returns it)."
+    )
+    return ToolError(message)
+
+
+def _event_write_response(
+    calendar_name: str, result: dict[str, Any]
+) -> EventWriteResponse:
+    return EventWriteResponse(
+        uid=result["uid"],
+        calendar_name=calendar_name,
+        etag=result["etag"],
+        href=result.get("href"),
+        status_code=result.get("status_code"),
+        event=result.get("event"),
     )
 
 
@@ -114,6 +166,18 @@ def _event_dict_to_summary(event: dict) -> CalendarEventSummary:
     )
 
 
+@require_scopes("calendar.delete")
+async def _require_delete_scope(ctx: Context) -> None:
+    """Gate for destructive paths of tools that otherwise need only ``calendar.write``.
+
+    ``@require_scopes`` is per tool, but ``nc_calendar_bulk_operations`` and
+    ``nc_calendar_manage_calendar`` mix harmless and destructive operations.
+    Running the check through the decorator keeps one implementation of the
+    token, Login Flow v2 stored-scope and BasicAuth rules instead of a copy that
+    could drift.
+    """
+
+
 def configure_calendar_tools(mcp: MCPServer):
     # Calendar tools
     @mcp.tool(
@@ -142,7 +206,7 @@ def configure_calendar_tools(mcp: MCPServer):
         start_datetime: str,
         ctx: Context,
         end_datetime: str = "",
-        all_day: bool = False,
+        all_day: bool | None = None,
         description: str = "",
         location: str = "",
         categories: str = "",
@@ -159,25 +223,37 @@ def configure_calendar_tools(mcp: MCPServer):
         color: str = "",
         timezone: str = "",
         reminders: list[Reminder] | None = None,
-    ):
+    ) -> EventWriteResponse:
         """Create a comprehensive calendar event with full feature support.
 
         Args:
             calendar_name: Name of the calendar to create the event in
             title: Event title
-            start_datetime: ISO format. Three modes:
-                - ``"2025-01-15T14:00:00Z"`` or ``"2025-01-15T14:00:00+00:00"``
-                  → stored as UTC.
-                - ``"2025-01-15T14:00:00"`` with ``timezone="America/New_York"``
-                  → stored as TZID-bound (server emits ``DTSTART;TZID=...:...``
-                  plus a VTIMEZONE component).
-                - ``"2025-01-15T14:00:00"`` alone → stored as RFC 5545 floating
-                  local time (interpreted by viewers in their own zone). A
-                  warning is logged so the choice is visible.
-                - ``"2025-01-15"`` for all-day events.
+            start_datetime: Start of the event, ISO 8601.
+
+                All-day events — pass a plain date, ``YYYY-MM-DD``. A date
+                without a time is recognised as all-day automatically
+                (``all_day`` may be left unset).
+
+                Timed events — pass date and time, ``YYYY-MM-DDTHH:MM:SS``:
+                - ``"2025-01-15T14:00:00"`` → stored in the default timezone
+                  (``Europe/Berlin`` unless the server is configured otherwise)
+                  or in ``timezone`` when given (as ``DTSTART;TZID=...``).
+                - ``"2025-01-15T14:00:00Z"`` / ``"...+01:00"`` → the stated
+                  instant; ``timezone`` is ignored.
             ctx: MCP context
-            end_datetime: ISO format end time, empty for all-day events
-            all_day: Whether this is an all-day event
+            end_datetime: End of the event, same format as ``start_datetime``.
+
+                For all-day events the end is **exclusive** (iCalendar DATE
+                semantics): it is the day *after* the last day. Examples:
+                - one day, 13 Nov 2025: ``start="2025-11-13"``, ``end="2025-11-14"``
+                  (or omit ``end_datetime`` for a single day)
+                - two days, 12–13 Nov 2025: ``start="2025-11-12"``, ``end="2025-11-14"``
+                An end equal to the start is corrected to the following day.
+                For timed events the end is the actual end time.
+            all_day: Leave unset in almost all cases; it is derived from
+                ``start_datetime`` (date only → all-day). Pass ``True`` to force
+                an all-day event from a datetime (the time part is dropped).
             description: Event description/details
             location: Event location
             categories: Comma-separated categories (e.g., "work,meeting")
@@ -213,7 +289,8 @@ def configure_calendar_tools(mcp: MCPServer):
                 subject) and ``related`` (START/END).
 
         Returns:
-            Dict with event creation result
+            ``uid`` (generated by the server), ``calendar_name``, ``etag`` and
+            ``event`` (the stored fields, as nc_calendar_get_event returns them).
         """
         client = await get_client(ctx)
 
@@ -246,7 +323,8 @@ def configure_calendar_tools(mcp: MCPServer):
         if reminders is not None:
             event_data["reminders"] = _reminders_to_dicts(reminders)
 
-        return await client.calendar.create_event(calendar_name, event_data)
+        result = await client.calendar.create_event(calendar_name, event_data)
+        return _event_write_response(calendar_name, result)
 
     @mcp.tool(
         title="List Calendar Events",
@@ -432,13 +510,24 @@ def configure_calendar_tools(mcp: MCPServer):
         timezone: str | None = None,
         reminders: list[Reminder] | None = None,
         etag: str = "",
-    ):
+    ) -> EventWriteResponse:
         """Update any aspect of an existing event.
 
         Only the arguments you pass are touched. Everything else on the stored
         event is preserved. See ``nc_calendar_create_event`` for the shared
         parameter semantics, including the datetime encoding rules that
-        ``timezone`` selects between.
+        ``timezone`` selects between and the all-day rules: a date-only
+        ``start_datetime`` (``YYYY-MM-DD``) makes it an all-day event and
+        ``end_datetime`` is the day *after* the last day. To move an all-day
+        event, pass both ``start_datetime`` and ``end_datetime``.
+
+        ``etag``: the ETag you last read (from ``nc_calendar_get_event`` or a
+        previous create/update). If the event changed since, nothing is written
+        and the error shows the event's current state so you can re-apply your
+        change. Omit it to guard only against changes during this call.
+
+        Each update raises the event's ``SEQUENCE`` and ``LAST-MODIFIED`` so
+        calendar clients see it as a revision.
 
         Recurrence, specifically:
 
@@ -496,9 +585,18 @@ def configure_calendar_tools(mcp: MCPServer):
         if reminders is not None:
             event_data["reminders"] = _reminders_to_dicts(reminders)
 
-        return await client.calendar.update_event(
-            calendar_name, event_uid, event_data, etag
-        )
+        try:
+            result = await client.calendar.update_event(
+                calendar_name, event_uid, event_data, etag
+            )
+        except DavPreconditionFailed as e:
+            current = None
+            try:
+                current, _ = await client.calendar.get_event(calendar_name, event_uid)
+            except (httpx.HTTPError, ValueError) as read_error:
+                logger.debug("Could not read %s after 412: %s", event_uid, read_error)
+            raise _stale_event_etag_error(event_uid, e, current) from e
+        return _event_write_response(calendar_name, result)
 
     @mcp.tool(
         title="Delete Calendar Event",
@@ -506,7 +604,7 @@ def configure_calendar_tools(mcp: MCPServer):
             destructive_hint=True, idempotent_hint=True, open_world_hint=True
         ),
     )
-    @require_scopes("calendar.write")
+    @require_scopes("calendar.delete")
     @instrument_tool
     async def nc_calendar_delete_event(
         calendar_name: str,
@@ -843,6 +941,10 @@ def configure_calendar_tools(mcp: MCPServer):
         if operation not in ["update", "delete", "move"]:
             raise ToolError("Operation must be 'update', 'delete', or 'move'")
 
+        # "move" deletes the original after copying, so both need calendar.delete.
+        if operation in ("delete", "move"):
+            await _require_delete_scope(ctx=ctx)
+
         # Convert date strings to datetime objects
         start_datetime = None
         end_datetime = None
@@ -1128,6 +1230,7 @@ def configure_calendar_tools(mcp: MCPServer):
             if not calendar_name:
                 raise ToolError("calendar_name is required for delete action")
 
+            await _require_delete_scope(ctx=ctx)
             return await client.calendar.delete_calendar(calendar_name)
 
         elif action == "update":

@@ -317,7 +317,8 @@ Scopes are **per-app** and follow an `<app>.<read|write>` pattern. There is no `
 | `notes.read` / `notes.write` | Notes app |
 | `talk.read` / `talk.write` | Talk (spreed) |
 | `files.read` / `files.write` | Files / WebDAV |
-| `calendar.read` / `calendar.write` | Calendar (events + tasks/VTODO) |
+| `calendar.read` / `calendar.write` | Calendar (events + tasks/VTODO): read, create, update |
+| `calendar.delete` | Calendar deletions: delete event, delete calendar, bulk delete/move. Separate from `calendar.write` on purpose |
 | `contacts.read` / `contacts.write` | Contacts (CardDAV) |
 | `deck.read` / `deck.write` | Deck |
 | `tables.read` / `tables.write` | Tables |

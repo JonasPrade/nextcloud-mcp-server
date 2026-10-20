@@ -256,6 +256,7 @@ NEXTCLOUD_VERIFY_SSL=false
 |----------|----------|---------|-------------|
 | `NEXTCLOUD_VERIFY_SSL` | ⚠️ Optional | `true` | Set to `false` to disable TLS certificate verification |
 | `NEXTCLOUD_CA_BUNDLE` | ⚠️ Optional | - | Path to a PEM CA bundle file for custom certificate authorities |
+| `CALENDAR_DEFAULT_TIMEZONE` | ⚠️ Optional | `Europe/Berlin` | IANA zone applied to timed calendar events given without a zone or UTC offset. Set to an empty value for RFC 5545 floating local time |
 | `NEXTCLOUD_HTTP_KEEPALIVE` | ⚠️ Optional | `true` | Reuse pooled keep-alive connections for the Nextcloud httpx client. Set to `false` to open a fresh connection per request. See the note below. |
 
 > **`NEXTCLOUD_HTTP_KEEPALIVE`** — With the default (`true`) the httpx client pools

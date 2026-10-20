@@ -1,6 +1,6 @@
 """Pydantic models for Calendar app responses."""
 
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -215,6 +215,31 @@ class CreateEventResponse(BaseResponse):
     event: CalendarEvent = Field(description="The created event")
     calendar_name: str = Field(
         description="Name of the calendar the event was created in"
+    )
+
+
+class EventWriteResponse(BaseResponse):
+    """Result of ``nc_calendar_create_event`` / ``nc_calendar_update_event``.
+
+    ``uid``, ``href``, ``etag`` and ``status_code`` keep the top-level keys the
+    tools returned before they were typed, so existing readers keep working.
+    """
+
+    uid: str = Field(description="UID of the event (generated server-side on create)")
+    calendar_name: str = Field(description="Calendar the event was written to")
+    etag: str = Field(
+        description=(
+            "ETag of the event after this write. Pass it as ``etag`` to "
+            "nc_calendar_update_event to detect concurrent changes."
+        )
+    )
+    href: str | None = Field(None, description="CalDAV URL of the event")
+    status_code: int | None = Field(None, description="HTTP status (201 / 200)")
+    event: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "The event as stored, in the same shape nc_calendar_get_event returns"
+        ),
     )
 
 

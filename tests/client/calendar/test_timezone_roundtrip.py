@@ -152,8 +152,29 @@ def test_create_ical_event_utc_input_stores_as_z_suffix(mocker):
     assert "VTIMEZONE" not in ical
 
 
-def test_create_ical_event_naive_without_tz_stores_floating(mocker):
-    """Naive input + no ``timezone`` parameter must store as floating local time."""
+def test_create_ical_event_naive_without_tz_uses_default_timezone(mocker):
+    """Naive input + no ``timezone`` parameter lands in the default zone (Europe/Berlin)."""
+    client = _make_client(mocker)
+    event_data = {
+        "title": "Default zone event",
+        "start_datetime": "2026-05-13T14:30:00",
+        "end_datetime": "2026-05-13T15:45:00",
+    }
+
+    ical = client._create_ical_event(event_data, event_uid="default-tz-uid")
+
+    assert "DTSTART;TZID=Europe/Berlin:20260513T143000" in ical
+    assert "DTEND;TZID=Europe/Berlin:20260513T154500" in ical
+    assert "BEGIN:VTIMEZONE" in ical
+    assert "TZID:Europe/Berlin" in ical
+
+
+def test_create_ical_event_naive_without_tz_stores_floating_when_default_empty(mocker):
+    """CALENDAR_DEFAULT_TIMEZONE="" restores RFC 5545 floating local time."""
+    mocker.patch(
+        "nextcloud_mcp_server.client.calendar.get_settings",
+        return_value=mocker.MagicMock(calendar_default_timezone=""),
+    )
     client = _make_client(mocker)
     event_data = {
         "title": "Floating event",
@@ -168,6 +189,21 @@ def test_create_ical_event_naive_without_tz_stores_floating(mocker):
     assert "DTSTART;TZID" not in ical
     assert "20260513T143000Z" not in ical
     assert "VTIMEZONE" not in ical
+
+
+def test_create_ical_event_offset_input_ignores_default_timezone(mocker):
+    """An explicit offset or Z wins over the default zone."""
+    client = _make_client(mocker)
+    event_data = {
+        "title": "UTC event",
+        "start_datetime": "2026-05-13T14:30:00Z",
+        "end_datetime": "2026-05-13T15:45:00Z",
+    }
+
+    ical = client._create_ical_event(event_data, event_uid="utc-uid")
+
+    assert "DTSTART:20260513T143000Z" in ical
+    assert "TZID" not in ical
 
 
 def test_create_ical_event_naive_with_timezone_emits_tzid_and_vtimezone(mocker):
@@ -207,8 +243,8 @@ def test_create_ical_event_offset_input_ignores_timezone_param(mocker):
     assert "VTIMEZONE" not in ical
 
 
-def test_create_ical_event_unknown_timezone_falls_back_to_floating(mocker, caplog):
-    """An unresolvable IANA name must not crash — fall back to floating local time."""
+def test_create_ical_event_unknown_timezone_falls_back_to_default(mocker, caplog):
+    """An unresolvable IANA name must not crash — the default zone applies instead."""
     client = _make_client(mocker)
     event_data = {
         "title": "Bogus TZ event",
@@ -219,8 +255,8 @@ def test_create_ical_event_unknown_timezone_falls_back_to_floating(mocker, caplo
 
     ical = client._create_ical_event(event_data, event_uid="bogus-uid")
 
-    assert "DTSTART:20260515T090000" in ical
-    assert "VTIMEZONE" not in ical
+    assert "DTSTART;TZID=Europe/Berlin:20260515T090000" in ical
+    assert "Continent/Imaginary" not in ical
 
 
 # ============= End-to-end: write → re-parse roundtrip preserves intent =============

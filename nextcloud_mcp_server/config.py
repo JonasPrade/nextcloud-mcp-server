@@ -74,6 +74,9 @@ _DEFAULTS: dict[str, Any] = {
     "introspection_uri": None,
     "userinfo_uri": None,
     "oidc_resource_server_id": None,
+    # Zone applied to timed calendar events given without one. Empty string
+    # restores RFC 5545 floating local time.
+    "calendar_default_timezone": "Europe/Berlin",
     # M2M / DCR / management — these MUST be declared here (lowercase) so dynaconf
     # reads the matching UPPERCASE env var; with ignore_unknown_envvars=True an
     # undeclared key is silently dropped (env value ignored), so they are read
@@ -1089,6 +1092,9 @@ class Settings:
     oidc_client_secret: str | None = None
     oidc_issuer: str | None = None
     oidc_resource_server_id: str | None = None
+    # CALENDAR_DEFAULT_TIMEZONE: IANA zone for timed events created or moved
+    # without an explicit zone or offset. Empty = floating local time.
+    calendar_default_timezone: str = "Europe/Berlin"
     oidc_token_type: str = "Bearer"  # NEXTCLOUD_OIDC_TOKEN_TYPE
     oidc_scopes: str = ""  # NEXTCLOUD_OIDC_SCOPES (space-separated)
 

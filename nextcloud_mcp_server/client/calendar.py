@@ -20,7 +20,7 @@ from icalendar import Event as ICalEvent
 from icalendar import Todo as ICalTodo
 from lxml import etree  # type: ignore[import-untyped]  # ty: ignore[unresolved-import]
 
-from ..config import get_nextcloud_ssl_verify
+from ..config import get_nextcloud_ssl_verify, get_settings
 from .availability import (
     Span,
     busy_spans_from_events,
@@ -1060,6 +1060,7 @@ class CalendarClient:
         calendar = self._get_calendar(calendar_name)
 
         event_uid = str(uuid.uuid4())
+        event_data = self._with_inferred_all_day(event_data)
         organizer = (
             await self._organizer_address() if event_data.get("attendees") else None
         )
@@ -1077,6 +1078,7 @@ class CalendarClient:
             "href": str(event.url),
             "etag": await self._object_etag(event),
             "status_code": 201,
+            "event": self._parse_ical_event(ical_content),
         }
 
     async def update_event(
@@ -1099,6 +1101,7 @@ class CalendarClient:
         """
         await self._ensure_calendar_home()
         calendar = self._get_calendar(calendar_name)
+        event_data = self._with_inferred_all_day(event_data)
 
         # Find the event by UID using caldav library
         event = await self._async_object_by_uid(
@@ -1136,6 +1139,7 @@ class CalendarClient:
             "href": str(event.url),
             "etag": new_etag,
             "status_code": 200,
+            "event": self._parse_ical_event(updated_ical),
         }
 
     @staticmethod
@@ -1697,7 +1701,7 @@ class CalendarClient:
             return ZoneInfo(tz_name)
         except ZoneInfoNotFoundError:
             logger.warning(
-                "Unknown IANA timezone %r — falling back to floating local time",
+                "Unknown IANA timezone %r — ignoring it (default timezone or floating local time applies)",
                 tz_name,
             )
             return None
@@ -1796,6 +1800,15 @@ class CalendarClient:
                     inherited_tz,
                 )
                 return parsed.replace(tzinfo=inherited_zi), inherited_zi
+
+        default_zi = cls._resolve_timezone(get_settings().calendar_default_timezone)
+        if default_zi is not None:
+            logger.debug(
+                "Datetime %r is naive; applying default timezone %s",
+                dt_str,
+                default_zi,
+            )
+            return parsed.replace(tzinfo=default_zi), default_zi
 
         logger.warning(
             "Datetime %r is naive and no timezone was supplied — storing as RFC 5545 floating local time",
@@ -2104,6 +2117,12 @@ class CalendarClient:
                         used_timezones.add(zi)
                     event.add("dtend", end_dt)
 
+        if all_day:
+            # DTEND is exclusive for DATE values, so a one-day event on the 13th
+            # ends on the 14th. A caller who passes the last day inclusively
+            # (end == start) would otherwise write a zero-length range.
+            self._clamp_all_day_end(event)
+
         # Add categories
         categories = event_data.get("categories", "")
         if categories:
@@ -2160,6 +2179,7 @@ class CalendarClient:
         event.add("created", now)
         event.add("dtstamp", now)
         event.add("last-modified", now)
+        event.add("sequence", 0)
 
         # VTIMEZONE must appear before the referencing VEVENT.
         for zi in used_timezones:
@@ -2606,6 +2626,9 @@ class CalendarClient:
                 now = dt.datetime.now(dt.UTC)
                 component["LAST-MODIFIED"] = vDDDTypes(now)
                 component["DTSTAMP"] = vDDDTypes(now)
+                # RFC 5545 3.8.7.4: revisions bump SEQUENCE, which is how clients
+                # tell a rescheduled event from a stale copy of it.
+                component["SEQUENCE"] = int(component.get("SEQUENCE", 0)) + 1
 
                 # Ensure VTIMEZONE definitions exist for any TZID we just attached.
                 existing_tzids = {
@@ -2647,6 +2670,33 @@ class CalendarClient:
 
         # Normalize fixed offsets to UTC so no TZID="UTC+02:00" is emitted.
         return parsed_dt.astimezone(dt.UTC)
+
+    @classmethod
+    def _infer_all_day(cls, event_data: dict[str, Any]) -> bool | None:
+        """Derive ``all_day`` from the shape of the start (or, failing that, end).
+
+        A bare ``YYYY-MM-DD`` names a whole day, so a caller that passes one and
+        leaves ``all_day`` unset means an all-day event; storing it as midnight
+        would silently turn it into a zero-length timed one. Returns ``None``
+        when the dates give no signal, which leaves the stored shape alone on
+        update.
+        """
+        for key in ("start_datetime", "end_datetime"):
+            value = event_data.get(key)
+            if value:
+                return cls._is_date_only(value)
+        return None
+
+    @classmethod
+    def _with_inferred_all_day(cls, event_data: dict[str, Any]) -> dict[str, Any]:
+        """Copy of ``event_data`` with an unset ``all_day`` filled in from the dates."""
+        if event_data.get("all_day") is not None:
+            return event_data
+        inferred = cls._infer_all_day(event_data)
+        data = {k: v for k, v in event_data.items() if k != "all_day"}
+        if inferred is not None:
+            data["all_day"] = inferred
+        return data
 
     @staticmethod
     def _is_date_only(value: str) -> bool:
@@ -3233,8 +3283,9 @@ class CalendarClient:
     def _availability_timezone(name: Any) -> dt.tzinfo:
         """Resolve the zone the windows are built in, refusing a bad name.
 
-        Deliberately not ``_resolve_timezone``, which falls back to floating
-        local time on an unknown name. That is right for storing an event --
+        Deliberately not ``_resolve_timezone``, which ignores an unknown name
+        (the default zone or floating local time applies instead). That is
+        right for storing an event --
         the time was still given -- but wrong here: business hours and
         preferred times mean nothing without the zone they are expressed in, so
         ``timezone="America/New_Yrok"`` would answer confidently in the

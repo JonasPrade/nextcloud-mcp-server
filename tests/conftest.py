@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_FULL_SCOPES = (
     "openid profile email "
     "notes.read notes.write "
-    "calendar.read calendar.write "
+    "calendar.read calendar.write calendar.delete "
     "todo.read todo.write "
     "contacts.read contacts.write "
     "cookbook.read cookbook.write "
@@ -87,7 +87,7 @@ DEFAULT_READ_SCOPES = (
 DEFAULT_WRITE_SCOPES = (
     "openid profile email "
     "notes.write "
-    "calendar.write "
+    "calendar.write calendar.delete "
     "todo.write "
     "contacts.write "
     "cookbook.write "
@@ -1962,7 +1962,7 @@ async def playwright_oauth_token(
         f"client_id={client_id}&"
         f"redirect_uri={quote(callback_url, safe='')}&"
         f"state={state}&"
-        f"scope=openid%20profile%20email%20notes.read%20notes.write%20calendar.read%20calendar.write%20contacts.read%20contacts.write%20cookbook.read%20cookbook.write%20deck.read%20deck.write%20tables.read%20tables.write%20files.read%20files.write%20sharing.read%20sharing.write"
+        f"scope=openid%20profile%20email%20notes.read%20notes.write%20calendar.read%20calendar.write%20calendar.delete%20contacts.read%20contacts.write%20cookbook.read%20cookbook.write%20deck.read%20deck.write%20tables.read%20tables.write%20files.read%20files.write%20sharing.read%20sharing.write"
     )
 
     # Add resource parameter (RFC 8707) if available
@@ -2680,7 +2680,7 @@ async def _get_oauth_token_for_user(
         f"redirect_uri={quote(callback_url, safe='')}&"
         f"state={state}&"
         f"resource={quote(mcp_server_resource, safe='')}&"  # Resource URI from PRM
-        f"scope=openid%20profile%20email%20notes.read%20notes.write%20calendar.read%20calendar.write%20contacts.read%20contacts.write%20cookbook.read%20cookbook.write%20deck.read%20deck.write%20tables.read%20tables.write%20files.read%20files.write%20sharing.read%20sharing.write"
+        f"scope=openid%20profile%20email%20notes.read%20notes.write%20calendar.read%20calendar.write%20calendar.delete%20contacts.read%20contacts.write%20cookbook.read%20cookbook.write%20deck.read%20deck.write%20tables.read%20tables.write%20files.read%20files.write%20sharing.read%20sharing.write"
     )
 
     logger.info("Performing browser OAuth flow for %s...", username)
@@ -3204,7 +3204,7 @@ async def configure_astrolabe_for_mcp_server(nc_client):
                 "--resource_url",
                 mcp_server_public_url,
                 "--allowed_scopes",
-                "openid profile email offline_access notes.read notes.write calendar.read calendar.write contacts.read contacts.write cookbook.read cookbook.write deck.read deck.write tables.read tables.write files.read files.write",
+                "openid profile email offline_access notes.read notes.write calendar.read calendar.write calendar.delete contacts.read contacts.write cookbook.read cookbook.write deck.read deck.write tables.read tables.write files.read files.write",
             ],
             check=True,
             capture_output=True,
