@@ -17,6 +17,25 @@
 | `nc_calendar_manage_calendar` | **New:** Create, delete, and manage calendar properties (`delete` needs `calendar.delete`) |
 | `nc_calendar_complete_todo` | **New:** Mark a todo complete, setting `STATUS`, `PERCENT-COMPLETE` and `COMPLETED` together |
 
+### Writing events: `nc_calendar_create_event` and `nc_calendar_update_event`
+
+These two tools are what a routine needs to maintain a calendar (for example "Branchentermine"). Deleting is **deliberately not part of them**: it needs the separate `calendar.delete` scope (see Scopes).
+
+| Case | `start_datetime` | `end_datetime` | Stored as |
+|------|------------------|----------------|-----------|
+| All-day, one day (13 Nov) | `2025-11-13` | `2025-11-14` or omitted | `DTSTART;VALUE=DATE:20251113`, `DTEND;VALUE=DATE:20251114` |
+| All-day, several days (12–13 Nov) | `2025-11-12` | `2025-11-14` | `DTSTART;VALUE=DATE:20251112`, `DTEND;VALUE=DATE:20251114` |
+| Timed | `2025-11-13T09:30:00` | `2025-11-13T11:00:00` | `DTSTART;TZID=Europe/Berlin:...` |
+
+- **All-day is derived from the format**: a date without a time is an all-day event; `all_day` is only needed to override that.
+- **`DTEND` of an all-day event is exclusive** (the day after the last day). An end equal to the start is moved to the next day.
+- **Timezone**: naive times use `timezone` if given, otherwise `CALENDAR_DEFAULT_TIMEZONE` (default `Europe/Berlin`). A `Z` or UTC offset is kept as given.
+- **Server-side metadata**: `UID` (UUID), `DTSTAMP`, `CREATED`, `LAST-MODIFIED` and `SEQUENCE` are set by the server. Every update raises `SEQUENCE` and refreshes `LAST-MODIFIED`.
+- **Escaping**: commas, semicolons and line breaks in title, location, description and categories are escaped; umlauts and dashes are stored as UTF-8. `categories` is a comma-separated string, so a single category cannot contain a comma.
+- **Update changes only the fields you pass.** Everything else stays as stored.
+- **ETag protection**: pass the `etag` you last read. If the event changed since, nothing is written and the error shows the event's current state. Without `etag`, only changes during the call itself are caught.
+- **Result**: `uid`, `calendar_name`, `etag`, `href`, `status_code` and `event` (the stored fields, same shape as `nc_calendar_get_event`).
+
 ### Scopes
 
 - `calendar.read`: list and read events and calendars.

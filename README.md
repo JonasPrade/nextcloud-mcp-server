@@ -82,7 +82,7 @@ For Kubernetes, see [cbcoutinho/helm-charts](https://github.com/cbcoutinho/helm-
 | App | Tools | Capabilities |
 |-----|-------|--------------|
 | **Notes** | 7 | Full CRUD, keyword search, semantic search |
-| **Calendar** | 20+ | Events, todos (tasks), recurring events, attendees, availability |
+| **Calendar** | 20+ | Events (create/update with all-day and ETag protection), todos (tasks), recurring events, attendees, availability. Deleting needs the separate `calendar.delete` scope, deliberately |
 | **Contacts** | 8 | Full CardDAV support, address books |
 | **Files (WebDAV)** | 14 | Filesystem access, OCR/document processing, file comments |
 | **Deck** | 15 | Boards, stacks, cards, labels, assignments |

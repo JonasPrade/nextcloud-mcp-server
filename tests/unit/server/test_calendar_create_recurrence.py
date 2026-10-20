@@ -31,7 +31,9 @@ def create_event_tool():
 async def _captured_event_data(tool, mocker, **kwargs):
     """Call the tool with a stubbed client and return the dict it forwarded."""
     client = mocker.MagicMock()
-    client.calendar.create_event = mocker.AsyncMock(return_value={"uid": "u"})
+    client.calendar.create_event = mocker.AsyncMock(
+        return_value={"uid": "u", "etag": "e"}
+    )
     mocker.patch(
         "nextcloud_mcp_server.server.calendar.get_client",
         mocker.AsyncMock(return_value=client),
