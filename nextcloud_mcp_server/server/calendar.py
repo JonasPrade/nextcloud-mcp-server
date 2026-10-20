@@ -114,6 +114,18 @@ def _event_dict_to_summary(event: dict) -> CalendarEventSummary:
     )
 
 
+@require_scopes("calendar.delete")
+async def _require_delete_scope(ctx: Context) -> None:
+    """Gate for destructive paths of tools that otherwise need only ``calendar.write``.
+
+    ``@require_scopes`` is per tool, but ``nc_calendar_bulk_operations`` and
+    ``nc_calendar_manage_calendar`` mix harmless and destructive operations.
+    Running the check through the decorator keeps one implementation of the
+    token, Login Flow v2 stored-scope and BasicAuth rules instead of a copy that
+    could drift.
+    """
+
+
 def configure_calendar_tools(mcp: MCPServer):
     # Calendar tools
     @mcp.tool(
@@ -506,7 +518,7 @@ def configure_calendar_tools(mcp: MCPServer):
             destructive_hint=True, idempotent_hint=True, open_world_hint=True
         ),
     )
-    @require_scopes("calendar.write")
+    @require_scopes("calendar.delete")
     @instrument_tool
     async def nc_calendar_delete_event(
         calendar_name: str,
@@ -843,6 +855,10 @@ def configure_calendar_tools(mcp: MCPServer):
         if operation not in ["update", "delete", "move"]:
             raise ToolError("Operation must be 'update', 'delete', or 'move'")
 
+        # "move" deletes the original after copying, so both need calendar.delete.
+        if operation in ("delete", "move"):
+            await _require_delete_scope(ctx=ctx)
+
         # Convert date strings to datetime objects
         start_datetime = None
         end_datetime = None
@@ -1128,6 +1144,7 @@ def configure_calendar_tools(mcp: MCPServer):
             if not calendar_name:
                 raise ToolError("calendar_name is required for delete action")
 
+            await _require_delete_scope(ctx=ctx)
             return await client.calendar.delete_calendar(calendar_name)
 
         elif action == "update":

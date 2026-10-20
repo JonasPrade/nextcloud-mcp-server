@@ -9,13 +9,21 @@
 | `nc_calendar_list_events` | **Enhanced:** List events with advanced filtering (min attendees, duration, categories, status, search across all calendars). `calendar_name` is optional when `search_all_calendars=True` |
 | `nc_calendar_get_event` | Get detailed information about a specific event |
 | `nc_calendar_update_event` | Update any aspect of an existing event |
-| `nc_calendar_delete_event` | Delete a calendar event |
+| `nc_calendar_delete_event` | Delete a calendar event (needs `calendar.delete`) |
 | `nc_calendar_create_meeting` | Quick meeting creation with smart defaults |
 | `nc_calendar_get_upcoming_events` | Get upcoming events in the next N days |
 | `nc_calendar_find_availability` | Find free time slots for meetings, from your own calendars plus any attendees' free/busy |
-| `nc_calendar_bulk_operations` | **New:** Bulk update, delete, or move events matching filter criteria |
-| `nc_calendar_manage_calendar` | **New:** Create, delete, and manage calendar properties |
+| `nc_calendar_bulk_operations` | **New:** Bulk update, delete, or move events matching filter criteria (`delete` and `move` need `calendar.delete`) |
+| `nc_calendar_manage_calendar` | **New:** Create, delete, and manage calendar properties (`delete` needs `calendar.delete`) |
 | `nc_calendar_complete_todo` | **New:** Mark a todo complete, setting `STATUS`, `PERCENT-COMPLETE` and `COMPLETED` together |
+
+### Scopes
+
+- `calendar.read`: list and read events and calendars.
+- `calendar.write`: create and update events. This scope **cannot delete anything**.
+- `calendar.delete`: every destructive path: `nc_calendar_delete_event`, `nc_calendar_bulk_operations` with `delete` or `move`, and `nc_calendar_manage_calendar` with `action="delete"`.
+
+A client that only maintains a calendar (create, reschedule) should be granted `calendar.read calendar.write` and not `calendar.delete`. Deletion is deliberate, not accidental.
 
 ### Calendar Integration
 

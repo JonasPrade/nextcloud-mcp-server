@@ -88,7 +88,7 @@ KEYCLOAK_OAUTH_PASSWORD = "admin"  # NOSONAR(S2068) - dev-only Keycloak bootstra
 KEYCLOAK_SUPPORTED_SCOPES = (
     "openid profile email "
     "notes.read notes.write "
-    "calendar.read calendar.write "
+    "calendar.read calendar.write calendar.delete "
     "todo.read todo.write "
     "contacts.read contacts.write "
     "cookbook.read cookbook.write "

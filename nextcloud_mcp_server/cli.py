@@ -111,7 +111,7 @@ logger = logging.getLogger(__name__)
 @click.option(
     "--oauth-scopes",
     envvar="NEXTCLOUD_OIDC_SCOPES",
-    default="openid profile email notes.read notes.write calendar.read calendar.write todo.read todo.write contacts.read contacts.write cookbook.read cookbook.write deck.read deck.write tables.read tables.write files.read files.write sharing.read sharing.write",
+    default="openid profile email notes.read notes.write calendar.read calendar.write calendar.delete todo.read todo.write contacts.read contacts.write cookbook.read cookbook.write deck.read deck.write tables.read tables.write files.read files.write sharing.read sharing.write",
     show_default=True,
     help="OAuth scopes to request during client registration. These define the maximum allowed scopes for the client. Note: Actual supported scopes are discovered dynamically from MCP tools at runtime. (can also use NEXTCLOUD_OIDC_SCOPES env var)",
 )

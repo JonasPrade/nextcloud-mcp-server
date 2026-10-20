@@ -69,6 +69,10 @@ ALL_SUPPORTED_SCOPES: frozenset[str] = frozenset(
         "notes.write",
         "calendar.read",
         "calendar.write",
+        # Destructive calendar operations (delete event, delete calendar, bulk
+        # delete/move). Split from calendar.write so a client can create and
+        # update events without being able to remove them.
+        "calendar.delete",
         "todo.read",
         "todo.write",
         "contacts.read",
