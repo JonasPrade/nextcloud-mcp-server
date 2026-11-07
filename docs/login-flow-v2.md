@@ -328,6 +328,7 @@ Scopes are **per-app** and follow an `<app>.<read|write>` pattern. There is no `
 | `shopping_list.read` / `shopping_list.write` | Shopping List |
 | `polls.read` / `polls.write` | Polls |
 | `news.read` | News (read-only) |
+| `mail.read` / `mail.write` / `mail.send` / `mail.draft` | Mail (see [mail.md](mail.md#scopes)) |
 | `sharing.write` | Share-link / share-permission management |
 | `semantic.read` | Semantic search + RAG (when enabled) |
 
@@ -342,8 +343,7 @@ Each MCP tool is decorated with `@require_scopes(...)`:
 ```python
 @mcp.tool()
 @require_scopes("notes.read")
-async def nc_notes_get_note(note_id: int, ctx: Context):
-    ...
+async def nc_notes_get_note(note_id: int, ctx: Context): ...
 ```
 
 Two layers apply, and **both** must permit a scope:
@@ -377,6 +377,43 @@ WWW-Authenticate: Bearer error="insufficient_scope",
 Clients can use this header to trigger **step-up authorization** — re-running the OAuth flow with additional scopes.
 
 Implementation: [`nextcloud_mcp_server/auth/scope_authorization.py`](../nextcloud_mcp_server/auth/scope_authorization.py).
+
+### Per-Group Scope Limits
+
+To cap what members of a group can do, whatever client they use, set the limit **at the IdP**. The MCP server needs no configuration for this: it enforces whatever scopes the token carries.
+
+**Nextcloud `oidc` app.** Group scope limits were added in the `cbcoutinho/oidc` fork and have been proposed upstream. They are managed on the admin page ("Group Scope Limits") or with occ:
+
+```bash
+occ oidc:group-scopes:set <group_id> "offline_access notes.read files.read"
+occ oidc:group-scopes:list
+occ oidc:group-scopes:delete <group_id>
+```
+
+How the limit is applied:
+
+- A member of limited groups is issued only scopes in the union of those groups' limits.
+- `openid profile email roles` are always allowed.
+- Include `offline_access` in the limit if members need refresh tokens.
+- Users in no limited group are not restricted.
+- The limit covers DCR clients.
+- It applies on authorize (before consent), on refresh (so removing a user from a group narrows their token at the next refresh), on token exchange, and on the `TokenGenerationRequestEvent` that Astrolabe mints through.
+
+This adds a third term to Layer 1:
+
+```
+token = requested ∩ client allowed_scopes ∩ group limit
+```
+
+**Keycloak.** Keycloak does this natively. A client scope with **role scope mappings** is granted only to users who hold one of those roles, and groups can carry roles. A scope the user isn't permitted is left out of the token; the request itself doesn't fail. Keycloak checks this on the authorization-code, refresh and token-exchange grants. In `realm-export.json`:
+
+```json
+"roles":  { "realm": [ { "name": "notes-writer" } ] },
+"groups": [ { "name": "notes-writers", "path": "/notes-writers", "realmRoles": ["notes-writer"] } ],
+"scopeMappings": [ { "clientScope": "notes.write", "roles": ["notes-writer"] } ]
+```
+
+Use **realm** roles. Token exchange with an `audience` strips client roles that don't belong to the audience client, so a client-role mapping can fail unexpectedly. The dev realm in `keycloak/realm-export.json` gates `notes.write` and `files.write` this way.
 
 ## OAuth Endpoints
 

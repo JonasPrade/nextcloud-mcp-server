@@ -5,6 +5,308 @@ All notable changes to the Nextcloud MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/).
 
+## v0.206.0 (2026-11-07)
+
+### BREAKING CHANGE
+
+- tool calls carrying arguments absent from the tool's
+inputSchema now return an error (isError) instead of succeeding with the
+extra keys ignored.
+
+### Fix
+
+- **server**: reject unknown tool arguments instead of ignoring them
+
+## v0.205.4 (2026-11-07)
+
+### Fix
+
+- **config**: warn once per unrecognised boolean; clearer timestamp error
+- **config**: warn on unrecognised boolean spellings; review round 1
+- **auth**: refuse any backslash in _safe_next_url
+- **auth**: reject backslash open redirect in _safe_next_url
+
+### Refactor
+
+- consolidate scalar parsers; replace input-family parametrizes with properties
+
+## v0.205.3 (2026-11-06)
+
+### Fix
+
+- keep an escaped ; or , inside one N, ADR, NICKNAME or CATEGORIES component on read
+
+## v0.205.2 (2026-11-06)
+
+### Fix
+
+- log a malformed webhook event body at warning with its traceback
+- make four payload parsers total over the inputs they claim to accept
+- bind new_string as a lambda default in apply_edits (Sonar S1515)
+- a quote ending in CR must not match half a CRLF pair in apply_edits
+- keep CRLF pairs intact in apply_edits and make normalize_etag idempotent
+
+### Refactor
+
+- reject a non-string webhook event class up front and log parser failures with exc_info
+
+## v0.205.1 (2026-11-06)
+
+### Fix
+
+- **ci**: kill the orphaned apt-get between Playwright install attempts
+- log what was swallowed where a handler falls back silently
+
+## v0.205.0 (2026-11-06)
+
+### Feat
+
+- **calendar**: report truncation in list_events and apply min_duration_minutes
+
+### Fix
+
+- **calendar**: reject negative list_events limit, log when a listing is cut
+- **calendar**: raise bulk-operation match cap from 50 to BULK_EVENT_LIMIT
+- **calendar**: apply event filters before the limit and honour limit across calendars
+- **sar**: cap the shielded case-folder cleanup and log why it failed
+- **sar**: keep the 403 to refused writes and clean up on cancellation
+- **sar**: report a refused case-file write as 403 and remove the new folder
+
+### Refactor
+
+- **calendar**: drop unused _apply_event_filters, note intentional full scan
+
+## v0.204.3 (2026-11-05)
+
+### Fix
+
+- resolve ty 0.0.97 diagnostics
+
+## v0.204.2 (2026-11-05)
+
+### Fix
+
+- make scope-challenge exception handler sync (python:S7503)
+- migrate off decorators removed in Starlette 1.0
+- **deps**: update dependency starlette to v1
+
+## v0.204.1 (2026-11-02)
+
+### Fix
+
+- **auth**: find a positionally-passed Context in require_scopes
+- **auth**: gate nc://capabilities and guard every registered resource
+- **auth**: enforce OAuth scopes on MCP resources
+
+### Refactor
+
+- **server**: register nc://capabilities from one place
+
+## v0.204.0 (2026-11-01)
+
+### Feat
+
+- **contacts**: write structured name (vCard N) on create and update
+
+### Fix
+
+- **contacts**: ignore an empty n string instead of clearing family name
+- **contacts**: treat null name components as not supplied
+- **contacts**: space-join list-valued N components
+
+## v0.203.3 (2026-11-01)
+
+### Fix
+
+- **logging**: configure httpx2/httpcore2 loggers and keep legacy httpx
+
+### Refactor
+
+- replace httpx with httpx2
+
+## v0.203.2 (2026-11-01)
+
+### Fix
+
+- **tables**: parse the Tables row payload in TableRow instead of raw dicts
+- **mcp**: wrap raw list returns from calendar and tables tools
+
+## v0.203.1 (2026-11-01)
+
+### Fix
+
+- **calendar**: stop rebuilding a VTODO from the partial update dict on error
+
+## v0.203.0 (2026-10-29)
+
+### Feat
+
+- **mail**: add nc_mail_view_attachment to show image attachments
+- **webdav**: add nc_webdav_view_image to show images to vision models
+- **client**: add WebDAVClient.get_preview for Nextcloud file previews
+- **webdav**: add nc_webdav_edit_file and line-range reads
+- **mail**: add opt-in MAIL_DRAFT_MARK_AI_GENERATED for saved drafts
+- **mail**: add mail.draft scope and nc_mail_save_draft tool
+
+### Fix
+
+- bound image decode memory and concurrency
+- **webdav**: edit only plain text files and cap oversized single lines
+
+### Refactor
+
+- **mail**: split the raw attachment download from get_attachment
+- **mail**: always mark drafts as AI-generated and drop draft_id
+
+## v0.202.2 (2026-10-28)
+
+### Refactor
+
+- **api**: Astrolabe 0.47.1 still calls vector-viz; name the right release
+- **api**: name the two migration differences; pin the warn-once
+- **api**: deprecate POST /api/v1/vector-viz/search
+
+## v0.202.1 (2026-10-26)
+
+### Fix
+
+- **contract**: close GatewayProvider on the test's own event loop
+- **deps**: pin mcp to 2.3.x for the streamable-HTTP session idle timeout
+
+## v0.202.0 (2026-10-26)
+
+### Feat
+
+- **notes**: add nc_notes_list_notes tool with a total count
+
+### Fix
+
+- **notes**: drop semicolons from the list_notes description
+- **notes**: keep list_notes count visible under truncation and bound its output
+
+### Refactor
+
+- **notes**: validate list_notes limit and stream the count
+
+## v0.201.3 (2026-10-26)
+
+### Fix
+
+- **ci**: never cancel pact runs for master pushes
+
+## v0.201.2 (2026-10-24)
+
+### Fix
+
+- **auth**: stop reporting every failed AS-proxy refresh as invalid_grant
+
+### Refactor
+
+- **auth**: drop _is_absolute_http_url from the AS-proxy refresh path
+
+## v0.201.1 (2026-10-24)
+
+### Fix
+
+- **server**: default serverInfo.version in NextcloudMCPServer itself
+- **server**: advertise serverInfo.version in the MCP handshake
+
+## v0.201.0 (2026-10-24)
+
+### Feat
+
+- **deck**: refuse startdate/color on Deck < 1.18
+- **deck**: support card startdate and color (Deck 1.18)
+
+### Fix
+
+- **deck**: surface malformed card color as ToolError
+- **deck**: drop semicolons from card tool descriptions
+- **deck**: reject non-hex card colors
+
+### Refactor
+
+- **deck**: extract _isoformat for date carry-over (Sonar S3358)
+
+## v0.200.5 (2026-10-21)
+
+### Fix
+
+- **client**: don't read a streamed request body in the request log hook
+
+## v0.200.4 (2026-10-21)
+
+### Fix
+
+- **auth**: store rotated refresh tokens with the IdP's lifetime (fixes #411)
+
+## v0.200.3 (2026-10-21)
+
+### Fix
+
+- **search**: address review — error wording, label docs, pass-through tests
+- **search**: fail fast when the query cannot be embedded, run bm25 keyword-only
+
+### Refactor
+
+- **search**: bound the query embed with a context manager
+
+## v0.200.2 (2026-10-20)
+
+### Fix
+
+- **http**: merge caller headers via httpx.Headers in the factory
+- **client**: send OCS-APIRequest from the httpx client, not per call site
+
+### Refactor
+
+- **webdav**: hoist text/xml content type; document factory scope
+- **client**: make NEXTCLOUD_DEFAULT_HEADERS read-only; clarify mail JSON headers
+
+## v0.200.1 (2026-10-20)
+
+### Fix
+
+- **search**: harden batched file verification per review
+- **auth**: reject unparseable Basic headers with 401
+- **auth**: verify multi-user BasicAuth credentials in the middleware
+
+### Perf
+
+- **search**: verify file results per result instead of re-walking the tagged corpus
+
+## v0.200.0 (2026-10-20)
+
+### Feat
+
+- **talk**: filter talk_get_messages by thread
+- **talk**: support creating and posting into Talk threads
+
+### Fix
+
+- **ci**: keep release smoke test on Python 3.11 (project floor)
+- **ci**: pin Python to 3.14 and cap Renovate below 3.15
+- **lint**: satisfy ty 0.0.89
+- **talk**: drop semicolon from talk_get_messages description
+- **talk**: only map spreed's thread 404 to "thread not found"
+- **documents**: read text inside Word content controls (w:sdt)
+
+### Refactor
+
+- **documents**: split the docx block walk into helpers (cognitive complexity)
+- **talk**: move thread 404 handling out of configure_talk_tools
+
+## v0.199.4 (2026-10-12)
+
+### Fix
+
+- **logging**: render a None body argument as None, not its size
+- **logging**: never log Authorization credentials or tool-call bodies
+
+### Refactor
+
+- **logging**: extract per-argument rendering to cut complexity
+
 ## v0.199.3 (2026-10-09)
 
 ### Fix

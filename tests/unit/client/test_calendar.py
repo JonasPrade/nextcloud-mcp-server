@@ -1,8 +1,8 @@
 """Unit tests for the CalendarClient construction path.
 
 These pin the wiring into ``caldav.aio.AsyncDAVClient``. caldav v3.x prefers
-``niquests`` over ``httpx`` and rejects ``httpx.Auth`` objects when ``niquests``
-is the active backend (issue #731), so we no longer build an httpx auth object
+``niquests`` over ``httpx2`` and rejects ``httpx2.Auth`` objects when ``niquests``
+is the active backend (issue #731), so we no longer build an httpx2 auth object
 ourselves — we pass the raw credential plus an explicit ``auth_type`` and let
 caldav build whichever auth its backend needs.
 """
@@ -18,7 +18,7 @@ pytestmark = pytest.mark.unit
 def test_basic_auth_passes_password_and_auth_type_basic(mocker):
     """Password path: pass ``password=`` + ``auth_type='basic'``, no ``auth=`` arg.
 
-    The previous wiring passed ``auth=httpx.BasicAuth(...)`` which caldav-on-niquests
+    The previous wiring passed ``auth=httpx2.BasicAuth(...)`` which caldav-on-niquests
     rejects with "Unexpected non-callable authentication" — the regression #731 came
     in via caldav 3.x's mandatory niquests dependency.
     """
@@ -36,7 +36,7 @@ def test_basic_auth_passes_password_and_auth_type_basic(mocker):
     assert call_kwargs["username"] == "alice"
     assert call_kwargs["password"] == "app-pw-1234"
     assert call_kwargs["auth_type"] == "basic"
-    # Critical: no httpx.Auth object — that's what broke under niquests.
+    # Critical: no httpx2.Auth object — that's what broke under niquests.
     assert "auth" not in call_kwargs
 
 
@@ -1405,9 +1405,7 @@ def test_updating_only_the_due_date_inherits_the_stored_value_type():
         "uid-todo-update",
     )
 
-    merged = client._merge_ical_todo_properties(
-        stored, {"due": "2026-09-30"}, "uid-todo-update"
-    )
+    merged = client._merge_ical_todo_properties(stored, {"due": "2026-09-30"})
 
     parsed = client._parse_ical_todo(merged)
     assert parsed["due"] == "2026-09-30"
@@ -1428,9 +1426,7 @@ def test_making_only_one_half_of_a_whole_day_pair_timed_is_rejected():
     )
 
     with pytest.raises(ValueError, match="dtstart and due"):
-        client._merge_ical_todo_properties(
-            stored, {"dtstart": "2026-08-08T09:00:00Z"}, "uid-todo-half-flip"
-        )
+        client._merge_ical_todo_properties(stored, {"dtstart": "2026-08-08T09:00:00Z"})
 
 
 def test_making_a_whole_day_todo_timed_works_when_both_sides_are_given():
@@ -1442,9 +1438,7 @@ def test_making_a_whole_day_todo_timed_works_when_both_sides_are_given():
     )
 
     merged = client._merge_ical_todo_properties(
-        stored,
-        {"dtstart": "2026-08-08T09:00:00Z", "due": "2026-08-08T17:00:00Z"},
-        "uid-todo-full-flip",
+        stored, {"dtstart": "2026-08-08T09:00:00Z", "due": "2026-08-08T17:00:00Z"}
     )
 
     parsed = client._parse_ical_todo(merged)
@@ -1461,9 +1455,25 @@ def test_an_unparseable_date_does_not_silently_rebuild_the_todo():
     )
 
     with pytest.raises(ValueError):
-        client._merge_ical_todo_properties(
-            stored, {"due": "not-a-date"}, "uid-todo-bad-date"
-        )
+        client._merge_ical_todo_properties(stored, {"due": "not-a-date"})
+
+
+def test_a_non_value_error_does_not_silently_rebuild_the_todo():
+    """Only ValueError used to propagate; everything else rebuilt from the update dict.
+
+    A malformed reminder raises AttributeError, which the catch-all answered by
+    returning ``_create_ical_todo(todo_data, ...)`` — a todo carrying nothing but the
+    fields of this one failed call, with the stored summary, categories and due date
+    dropped and success reported.
+    """
+    client = _pure_client()
+    stored = client._create_ical_todo(
+        {"summary": "Keep me", "categories": "home", "due": "2026-08-08"},
+        "uid-todo-bad-reminder",
+    )
+
+    with pytest.raises(AttributeError):
+        client._merge_ical_todo_properties(stored, {"reminders": ["not-a-mapping"]})
 
 
 def test_unrelated_todo_update_survives_a_stored_mismatch():
@@ -1473,9 +1483,7 @@ def test_unrelated_todo_update_survives_a_stored_mismatch():
         {"summary": "Legacy", "due": "2026-08-08"}, "uid-todo-untouched"
     ).replace("DTSTAMP", "DTSTART;VALUE=DATE-TIME:20260801T090000Z\r\nDTSTAMP", 1)
 
-    merged = client._merge_ical_todo_properties(
-        stored, {"summary": "Renamed"}, "uid-todo-untouched"
-    )
+    merged = client._merge_ical_todo_properties(stored, {"summary": "Renamed"})
 
     parsed = client._parse_ical_todo(merged)
     assert parsed["summary"] == "Renamed"
@@ -1489,9 +1497,7 @@ def test_updating_a_timed_todo_with_a_bare_date_keeps_it_timed():
         {"summary": "Review PR", "dtstart": "2026-08-08T09:00:00Z"}, "uid-todo-timed-up"
     )
 
-    merged = client._merge_ical_todo_properties(
-        stored, {"due": "2026-08-09"}, "uid-todo-timed-up"
-    )
+    merged = client._merge_ical_todo_properties(stored, {"due": "2026-08-09"})
 
     assert client._parse_ical_todo(merged)["due"] == "2026-08-09T00:00:00+00:00"
 
@@ -1902,3 +1908,55 @@ def test_bulk_targets_never_moves_a_series():
 
     assert targets == []
     assert skipped[0]["status"] == "skipped"
+
+
+async def test_get_calendar_events_filters_before_limit(mocker):
+    """GH #1774: the limit used to cut the listing (in CalDAV order) before the
+    filters ran, so a match past the first ``limit`` events vanished."""
+    import datetime as dt
+
+    from nextcloud_mcp_server.client.calendar import CalendarClient
+
+    def ics(uid: str, day: int, title: str) -> str:
+        return (
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//t//EN\r\n"
+            f"BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20260101T000000Z\r\n"
+            f"DTSTART:202609{day:02d}T100000Z\r\nDTEND:202609{day:02d}T110000Z\r\n"
+            f"SUMMARY:{title}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+
+    # Server order: latest noise first, the match last.
+    objs = [
+        mocker.Mock(data=ics(f"n{d}", d, "Standup"), url=f"/n{d}.ics", etag="e")
+        for d in range(20, 2, -1)
+    ]
+    objs.append(mocker.Mock(data=ics("w", 25, "Workshop X"), url="/w.ics", etag="e"))
+    for o in objs:
+        o.load = mocker.Mock(return_value=None)
+
+    client = CalendarClient("https://cloud.example.org", "alice")
+    mocker.patch.object(client, "_ensure_calendar_home", mocker.AsyncMock())
+    mocker.patch.object(client, "_get_calendar", return_value=mocker.Mock())
+    mocker.patch.object(
+        client, "_search_events_by_date", mocker.AsyncMock(return_value=objs)
+    )
+    window = (dt.datetime(2026, 9, 1), dt.datetime(2026, 9, 30))
+
+    found = await client.get_calendar_events(
+        "personal", *window, limit=5, filters={"title_contains": "workshop"}
+    )
+    assert [e["uid"] for e in found] == ["w"]
+
+    # min_duration_minutes was accepted by the tool but never applied.
+    long_only = await client.get_calendar_events(
+        "personal", *window, filters={"min_duration_minutes": 61}
+    )
+    assert long_only == []
+    hour_ok = await client.get_calendar_events(
+        "personal", *window, filters={"min_duration_minutes": 60}
+    )
+    assert len(hour_ok) == len(objs)
+
+    # Unfiltered, the cut keeps the earliest events, not the first returned.
+    earliest = await client.get_calendar_events("personal", *window, limit=3)
+    assert [e["uid"] for e in earliest] == ["n3", "n4", "n5"]

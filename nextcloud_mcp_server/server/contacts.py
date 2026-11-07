@@ -2,7 +2,7 @@ import logging
 from datetime import date
 from typing import Any
 
-from httpx import HTTPStatusError
+from httpx2 import HTTPStatusError
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -18,6 +18,7 @@ from nextcloud_mcp_server.models.contacts import (
     UpdateContactResponse,
 )
 from nextcloud_mcp_server.observability.metrics import instrument_tool
+from nextcloud_mcp_server.utils.parsing import split_csv
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ def _parse_categories(raw_categories: str | list | None) -> list[str]:
     """
     raw_categories = raw_categories or []
     if isinstance(raw_categories, str):
-        return [c.strip() for c in raw_categories.split(",") if c.strip()]
+        return split_csv(raw_categories)
     return [c for c in raw_categories if isinstance(c, str) and c]
 
 
@@ -441,7 +442,14 @@ def configure_contacts_tools(mcp: MCPServer):
             uid: The unique ID for the contact.
             contact_data: A dictionary with the contact's details. Supported keys:
 
-                - ``fn`` (str, required): Formatted full name.
+                - ``fn`` (str): Formatted full name. Required unless name
+                  parts are given, in which case it is derived from them.
+                - ``given_name``, ``family_name``, ``additional_names``,
+                  ``honorific_prefix``, ``honorific_suffix`` (str): Structured
+                  name, written as vCard ``N``. Alternatively pass ``n`` as a
+                  dict with these keys or as a list ``[family, given, ...]``.
+                  ``fn`` is never split into parts. Without them, ``N`` is
+                  written empty.
                 - ``email`` (str or list of str/dicts): Email address(es).
                 - ``tel`` / ``phone`` (str or list): Phone number(s).
                 - ``org`` / ``organization`` (str or list of str): Organization.
@@ -501,7 +509,12 @@ def configure_contacts_tools(mcp: MCPServer):
             contact_data: A dictionary with the contact's updated details. Supported
                 keys mirror nc_contacts_create_contact:
 
-                - ``fn`` (str): Formatted full name.
+                - ``fn`` (str): Formatted full name. Not derived from name
+                  parts on update. Pass it explicitly to change it.
+                - ``given_name``, ``family_name``, ``additional_names``,
+                  ``honorific_prefix``, ``honorific_suffix`` (str), or ``n``
+                  (dict or list): Structured name. Only the
+                  components passed are changed, the rest are kept.
                 - ``email`` (str): Email address. **Update path supports plain
                   strings only**. Dict / list-form inputs are not applied — the
                   existing EMAIL line is preserved unchanged and a warning is

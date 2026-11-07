@@ -8,15 +8,22 @@ PR #719 review without standing up the compose stack.
 from datetime import date
 
 import pytest
+from hypothesis import example, given
+from hypothesis import strategies as st
 from pythonvCard4.vcard import Contact, ValidationError
 
 from nextcloud_mcp_server.client.contacts import (
+    _N_COMPONENTS,
     ContactsClient,
     _build_contact_from_data,
+    _escape_n_component,
     _first_custom,
+    _merge_n_value,
     _normalize_contact_data,
     _parse_vcard,
     _project_contact,
+    _split_unescaped,
+    _unescape_component,
     _wrap_contact_field,
 )
 
@@ -999,6 +1006,81 @@ class TestVcardLineFolding:
         assert "item1.X-ABLabel:homepage" in result
 
 
+class TestStructuredName:
+    """Issue #1749: write vCard N on create and update."""
+
+    @staticmethod
+    def _merge(raw: str, data: dict) -> str:
+        client = ContactsClient.__new__(ContactsClient)
+        return client._merge_vcard_properties(raw, _normalize_contact_data(data))
+
+    def test_create_writes_n_from_flat_keys(self):
+        card = _vcard(fn="Jane Doe", given_name="Jane", family_name="Doe")
+        assert "N:Doe;Jane;;;" in card
+        assert _project_contact(_parse_vcard(card))["n"][:2] == ["Doe", "Jane"]
+
+    def test_create_with_fn_only_writes_empty_n(self):
+        assert "N:;;;;" in _vcard(fn="Jane Doe")
+
+    def test_create_derives_fn_from_parts(self):
+        card = _vcard(
+            n={
+                "honorific_prefix": "Dr.",
+                "given_name": "Jane",
+                "family_name": "van Doe",
+            }
+        )
+        assert "FN:Dr. Jane van Doe" in card
+        assert "N:van Doe;Jane;;Dr.;" in card
+
+    @pytest.mark.parametrize("n", ["Doe;Jane;;;", ["Doe", "Jane"]])
+    def test_n_string_and_list_forms(self, n):
+        assert "N:Doe;Jane;;;" in _vcard(fn="x", n=n)
+
+    def test_flat_key_wins_over_n(self):
+        assert "N:Roe;Jane;;;" in _vcard(fn="x", n="Doe;Jane", family_name="Roe")
+
+    def test_create_escapes_separators(self):
+        card = _vcard(fn="x", given_name="Jane", family_name="Doe;x")
+        assert "N:Doe\\;x;Jane;;;" in card
+
+    def test_update_changes_only_given_components(self):
+        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:u\nFN:Jane\nN:Doe;Jane;Q\\;R;Dr.;\nEND:VCARD\n"
+        result = self._merge(existing, {"given_name": "Janet"})
+        assert "N:Doe;Janet;Q\\;R;Dr.;" in result
+        assert "FN:Jane" in result
+
+    def test_update_adds_n_when_missing(self):
+        existing = "BEGIN:VCARD\nVERSION:3.0\nUID:u\nFN:Jane Doe\nEND:VCARD\n"
+        result = self._merge(existing, {"family_name": "Doe", "given_name": "Jane"})
+        assert "N:Doe;Jane;;;" in result
+
+    def test_update_keeps_n_parameters_and_group(self):
+        existing = (
+            "BEGIN:VCARD\nVERSION:4.0\nUID:u\nFN:J\n"
+            "item1.N;SORT-AS=Doe:Doe;J;;;\nEND:VCARD\n"
+        )
+        result = self._merge(existing, {"given_name": "Jane"})
+        assert "item1.N;SORT-AS=Doe:Doe;Jane;;;" in result
+
+    def test_update_preserves_extra_components(self):
+        existing = "BEGIN:VCARD\nVERSION:4.0\nUID:u\nFN:J\nN:Doe;J;;;;x\nEND:VCARD\n"
+        assert "N:Doe;Jane;;;;x" in self._merge(existing, {"given_name": "Jane"})
+
+    def test_none_component_is_not_supplied_on_update(self):
+        existing = "BEGIN:VCARD\nVERSION:4.0\nUID:u\nFN:J\nN:Doe;J;;;\nEND:VCARD\n"
+        result = self._merge(existing, {"given_name": "Jane", "family_name": None})
+        assert "N:Doe;Jane;;;" in result
+
+    def test_empty_n_string_is_not_supplied_on_update(self):
+        existing = "BEGIN:VCARD\nVERSION:4.0\nUID:u\nFN:J\nN:Doe;J;;;\nEND:VCARD\n"
+        assert "N:Doe;J;;;" in self._merge(existing, {"n": "", "note": "x"})
+
+    def test_list_component_is_space_joined(self):
+        card = _vcard(fn="x", additional_names=["Mary", "Anne"], family_name="Doe")
+        assert "N:Doe;;Mary Anne;;" in card
+
+
 @pytest.mark.parametrize("bad_line", ["BDAY;VALUE=DATE:--1226", "GEO:37.38,-122.08"])
 def test_unparseable_property_drops_only_that_property(bad_line: str):
     """Issue #1551: one bad property must not blank the whole contact."""
@@ -1039,3 +1121,90 @@ def test_upstream_still_raises_on_bad_property(bad_line: str):
     """
     with pytest.raises(ValueError):
         Contact.from_vcard(f"BEGIN:VCARD\r\nFN:x\r\n{bad_line}\r\nEND:VCARD\r\n")
+
+
+# ── N value escaping (property-based) ────────────────────────────────────
+
+
+def _crlf_to_lf(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+name_parts = st.dictionaries(st.sampled_from(_N_COMPONENTS), st.text())
+
+
+@given(st.text())
+@example("Doe;x")
+@example("C:\\")
+@example("a\\nb")  # a literal backslash-n, not a line break
+def test_escape_n_component_is_one_lossless_component(value):
+    escaped = _escape_n_component(value)
+
+    assert _split_unescaped(escaped) == [escaped]
+    assert _unescape_component(escaped) == _crlf_to_lf(value)
+
+
+@given(name_parts, name_parts)
+# An escaped trailing backslash ("\\\\") was read as escaping the separator
+# after it, so the next merge shifted every component one slot to the left.
+@example({"family_name": "C:\\"}, {"given_name": "Bob"})
+def test_merge_n_value_writes_supplied_slots_and_keeps_the_rest(first, second):
+    merged = _merge_n_value(_merge_n_value("", first), second)
+
+    expected = [second.get(k, first.get(k, "")) for k in _N_COMPONENTS]
+    assert [_unescape_component(c) for c in _split_unescaped(merged)] == [
+        _crlf_to_lf(v) for v in expected
+    ]
+    assert _merge_n_value(merged, second) == merged
+
+
+# ── Structured values on read (property-based) ───────────────────────────
+
+#: Component text. Line-breaking characters other than CR/LF are excluded: the
+#: vCard is split with ``str.splitlines``, which breaks on those too, and
+#: neither we nor the library escape them.
+_component = st.text(
+    st.characters(exclude_categories=("Cc", "Cs", "Zl", "Zp"))
+    | st.sampled_from(";,\\\n\r")
+)
+
+
+def _structured_line(name: str, comps: list[str], sep: str) -> str:
+    return f"{name}:{sep.join(_escape_n_component(c) for c in comps)}"
+
+
+@given(
+    st.lists(_component, min_size=5, max_size=5),
+    st.lists(_component, min_size=7, max_size=7),
+    st.lists(_component, min_size=1, max_size=3),
+    st.lists(_component, min_size=1, max_size=4),
+)
+# pythonvCard4 <= 0.2.0 unescapes before splitting, so each of these split one
+# component in two (sharf-shawon/pythonvCard4#5).
+@example(
+    ["Doe;Jr", "John", "", "", ""],
+    ["", "", "1; Main St", "Town", "", "", ""],
+    ["J;D"],
+    ["R,D", "Sales"],
+)
+def test_structured_values_parse_into_their_components(n, adr, nickname, categories):
+    """An escaped separator inside a component stays inside it on read."""
+    text = "\n".join(
+        [
+            "BEGIN:VCARD",
+            "VERSION:4.0",
+            "FN:x",
+            _structured_line("N", n, ";"),
+            _structured_line("ADR;TYPE=home", adr, ";"),
+            _structured_line("NICKNAME", nickname, ";"),
+            _structured_line("CATEGORIES", categories, ","),
+            "END:VCARD",
+        ]
+    )
+
+    contact = _parse_vcard(text)
+
+    assert contact.n == [_crlf_to_lf(c) for c in n]
+    assert contact.adr == [{"value": [_crlf_to_lf(c) for c in adr], "type": ["home"]}]
+    assert contact.nickname == [_crlf_to_lf(c) for c in nickname]
+    assert contact.categories == [_crlf_to_lf(c) for c in categories]

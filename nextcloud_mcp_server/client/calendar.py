@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anyio
-import httpx
+import httpx2
 import recurring_ical_events
 from caldav.aio import AsyncCalendar, AsyncDAVClient, AsyncEvent
 from caldav.elements import cdav, dav
@@ -48,6 +48,10 @@ CALENDAR_FANOUT = 8
 # Bounded all the same, so one pathological calendar cannot pull an unlimited
 # listing into memory.
 AVAILABILITY_EVENT_LIMIT = 1000
+
+# Per-calendar match cap for bulk update/delete/move. Same reasoning: the
+# listing default of 50 made a bulk operation silently leave matches untouched.
+BULK_EVENT_LIMIT = 1000
 
 # The URI scheme RFC 6638 addresses attendees by.
 _MAILTO = "mailto:"
@@ -331,9 +335,9 @@ class CalendarClient:
 
         Pass the raw credential plus an explicit ``auth_type`` so caldav can
         build whichever auth object its active HTTP backend needs. caldav v3
-        prefers ``niquests`` over ``httpx`` and won't accept an ``httpx.Auth``
+        prefers ``niquests`` over ``httpx2`` and won't accept an ``httpx2.Auth``
         when ``niquests`` is the active backend (issue #731), so we no longer
-        accept a pre-built ``httpx.Auth`` here.
+        accept a pre-built ``httpx2.Auth`` here.
 
         Args:
             base_url: Nextcloud base URL
@@ -464,7 +468,7 @@ class CalendarClient:
                     f"{self.base_url}/remote.php/dav/calendars/{principal_id}/"
                 )
                 self._principal_resolved = True
-        except (caldav_error.DAVError, httpx.HTTPError, ValueError) as e:
+        except (caldav_error.DAVError, httpx2.HTTPError, ValueError) as e:
             logger.warning(
                 "CalDAV principal discovery failed; using username path: %s", e
             )
@@ -501,13 +505,13 @@ class CalendarClient:
             organizer = vCalAddress(mailto)
             try:
                 display_name = await _maybe_await(principal.get_display_name())
-            except (caldav_error.DAVError, httpx.HTTPError, ValueError):
+            except (caldav_error.DAVError, httpx2.HTTPError, ValueError):
                 display_name = None
             if display_name:
                 organizer.params["CN"] = vText(display_name)
             self._organizer = organizer
             return organizer
-        except (caldav_error.DAVError, httpx.HTTPError, ValueError) as e:
+        except (caldav_error.DAVError, httpx2.HTTPError, ValueError) as e:
             logger.warning("Could not resolve ORGANIZER address: %s", e)
             return None
 
@@ -875,8 +879,15 @@ class CalendarClient:
         start_datetime: dt.datetime | None = None,
         end_datetime: dt.datetime | None = None,
         limit: int = 50,
+        filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """List events in a calendar within date range."""
+        """List events in a calendar within date range.
+
+        ``filters`` are applied *before* ``limit``, and the cut keeps the
+        earliest events by start. Truncating first (in CalDAV response order)
+        made a filtered search silently miss matches past the first ``limit``
+        events (GH #1774).
+        """
         await self._ensure_calendar_home()
         calendar = self._get_calendar(calendar_name)
 
@@ -922,18 +933,27 @@ class CalendarClient:
                 cal, start_datetime, end_datetime, do_expand
             )
             for event_dict in event_dicts:
+                if filters and not self._event_matches_filters(event_dict, filters):
+                    continue
                 event_dict["href"] = href
                 event_dict["etag"] = etag
                 result.append(event_dict)
 
-                if len(result) >= limit:
-                    break
-
-            if len(result) >= limit:
-                break
-
-        logger.debug("Found %d events", len(result))
-        return result
+        # The whole window is scanned on purpose (no early break at ``limit``):
+        # "earliest N matches" needs every match before the cut.
+        # ponytail: ISO strings sort lexicographically, so all-day dates and
+        # differing UTC offsets order approximately; parse to instants if that matters.
+        result.sort(key=lambda e: e.get("start_datetime", ""))
+        if len(result) > limit:
+            # Leaves a trace when a cap bites -- notably BULK_EVENT_LIMIT, whose
+            # callers have no ``truncated`` field to report it through.
+            logger.info(
+                "Calendar %s: %d events matched, keeping the earliest %d",
+                calendar_name,
+                len(result),
+                limit,
+            )
+        return result[:limit]
 
     def _expand_event_occurrences(
         self,
@@ -1378,7 +1398,11 @@ class CalendarClient:
         async with limiter:
             try:
                 events = await self.get_calendar_events(
-                    calendar["name"], start_datetime, end_datetime, limit=limit
+                    calendar["name"],
+                    start_datetime,
+                    end_datetime,
+                    limit=limit,
+                    filters=filters,
                 )
             except Exception as e:
                 logger.warning(
@@ -1389,10 +1413,6 @@ class CalendarClient:
                         {"calendar_name": calendar["name"], "error": str(e)}
                     )
                 return
-
-        # Apply filters if provided
-        if filters:
-            events = self._apply_event_filters(events, filters)
 
         # Add calendar info to each event
         for event in events:
@@ -1418,7 +1438,8 @@ class CalendarClient:
     ) -> list[dict[str, Any]]:
         """Search events across all calendars with advanced filtering.
 
-        ``limit`` is per calendar, and truncation is silent -- callers that
+        ``limit`` is per calendar (applied after ``filters``, keeping the
+        earliest events), and truncation is silent -- callers that
         need every event in the window (availability, above all) must raise it
         rather than accept a listing that merely looks complete.
 
@@ -1585,7 +1606,6 @@ class CalendarClient:
             updated_ical = self._merge_ical_todo_properties(
                 todo.data,  # type: ignore[arg-type]
                 todo_data,
-                todo_uid,
             )
             logger.debug("Merged iCal data length: %s", len(updated_ical))
 
@@ -2937,122 +2957,118 @@ class CalendarClient:
             return None
 
     def _merge_ical_todo_properties(
-        self, raw_ical: str, todo_data: dict[str, Any], todo_uid: str
+        self, raw_ical: str, todo_data: dict[str, Any]
     ) -> str:
-        """Merge new todo data into existing raw iCal while preserving all properties."""
-        try:
-            logger.debug(
-                "Merging todo properties for %s: %s", todo_uid, list(todo_data.keys())
-            )
-            cal = Calendar.from_ical(raw_ical)
+        """Merge new todo data into existing raw iCal while preserving all properties.
 
-            for component in cal.walk():
-                if component.name == "VTODO":
-                    # Update only provided properties
-                    if "summary" in todo_data:
-                        component["SUMMARY"] = todo_data["summary"]
-                    if "description" in todo_data:
-                        component["DESCRIPTION"] = todo_data["description"]
-                    if "status" in todo_data:
-                        status_value = todo_data["status"].upper()
-                        component["STATUS"] = status_value
-                        logger.debug("Set STATUS to %s", status_value)
-                    if "priority" in todo_data:
-                        component["PRIORITY"] = todo_data["priority"]
-                    if "percent_complete" in todo_data:
-                        percent_value = todo_data["percent_complete"]
-                        component["PERCENT-COMPLETE"] = percent_value
-                        logger.debug("Set PERCENT-COMPLETE to %s", percent_value)
+        The todo's own ``UID`` is carried through from ``raw_ical`` like any other
+        preserved property, so no ``todo_uid`` argument is needed. (One used to be
+        required solely by the removed rebuild fallback.)
 
-                    # Due / start dates, paired the same way as
-                    # _create_ical_todo — except a side that isn't being
-                    # updated votes with the value type already stored.
-                    supplied = {
-                        prop: todo_data[prop]
-                        for prop in ("due", "dtstart")
-                        if todo_data.get(prop)
-                    }
-                    date_only = all(
-                        self._is_date_only(v) for v in supplied.values()
-                    ) and all(
-                        self._stored_is_all_day(component, prop.upper()) is not False
-                        for prop in ("due", "dtstart")
-                        if prop not in supplied
+        Raises on any merge failure rather than substituting a synthesised todo.
+        This previously caught every exception and fell back to
+        ``_create_ical_todo(todo_data, ...)``, which rebuilds the todo from the
+        *partial update dict* — destroying summary, due date, dtstart, completed
+        timestamp, categories, RRULE, alarms and every custom property the caller
+        did not happen to pass, while reporting success.
+        """
+        logger.debug("Merging todo properties: %s", list(todo_data.keys()))
+        cal = Calendar.from_ical(raw_ical)
+
+        for component in cal.walk():
+            if component.name == "VTODO":
+                # Update only provided properties
+                if "summary" in todo_data:
+                    component["SUMMARY"] = todo_data["summary"]
+                if "description" in todo_data:
+                    component["DESCRIPTION"] = todo_data["description"]
+                if "status" in todo_data:
+                    status_value = todo_data["status"].upper()
+                    component["STATUS"] = status_value
+                    logger.debug("Set STATUS to %s", status_value)
+                if "priority" in todo_data:
+                    component["PRIORITY"] = todo_data["priority"]
+                if "percent_complete" in todo_data:
+                    percent_value = todo_data["percent_complete"]
+                    component["PERCENT-COMPLETE"] = percent_value
+                    logger.debug("Set PERCENT-COMPLETE to %s", percent_value)
+
+                # Due / start dates, paired the same way as
+                # _create_ical_todo — except a side that isn't being
+                # updated votes with the value type already stored.
+                supplied = {
+                    prop: todo_data[prop]
+                    for prop in ("due", "dtstart")
+                    if todo_data.get(prop)
+                }
+                date_only = all(
+                    self._is_date_only(v) for v in supplied.values()
+                ) and all(
+                    self._stored_is_all_day(component, prop.upper()) is not False
+                    for prop in ("due", "dtstart")
+                    if prop not in supplied
+                )
+
+                # A partial update cannot flip one half of the pair on its
+                # own: writing the supplied side as a DATE-TIME while the
+                # side left out stays a stored DATE is exactly the mismatch
+                # §3.8.2.3 forbids, and there is no defensible time of day
+                # to invent for the property the caller didn't mention.
+                # _validate_all_day_flip rejects the same flip for VEVENT.
+                stranded = [
+                    prop
+                    for prop in ("due", "dtstart")
+                    if supplied
+                    and not date_only
+                    and prop not in supplied
+                    and self._stored_is_all_day(component, prop.upper())
+                ]
+                if stranded:
+                    raise ValueError(
+                        "changing a whole-day todo to a timed one requires "
+                        f"passing {' and '.join(sorted(supplied.keys() | set(stranded)))} "
+                        "together, so DUE and DTSTART cannot end up with "
+                        "mismatched value types"
                     )
 
-                    # A partial update cannot flip one half of the pair on its
-                    # own: writing the supplied side as a DATE-TIME while the
-                    # side left out stays a stored DATE is exactly the mismatch
-                    # §3.8.2.3 forbids, and there is no defensible time of day
-                    # to invent for the property the caller didn't mention.
-                    # _validate_all_day_flip rejects the same flip for VEVENT.
-                    stranded = [
-                        prop
-                        for prop in ("due", "dtstart")
-                        if supplied
-                        and not date_only
-                        and prop not in supplied
-                        and self._stored_is_all_day(component, prop.upper())
-                    ]
-                    if stranded:
-                        raise ValueError(
-                            "changing a whole-day todo to a timed one requires "
-                            f"passing {' and '.join(sorted(supplied.keys() | set(stranded)))} "
-                            "together, so DUE and DTSTART cannot end up with "
-                            "mismatched value types"
-                        )
+                for prop, value in supplied.items():
+                    parsed = self._parse_todo_date(value, date_only=date_only)
+                    component[prop.upper()] = vDDDTypes(parsed)
+                    logger.debug("Set %s to %s", prop.upper(), parsed)
 
-                    for prop, value in supplied.items():
-                        parsed = self._parse_todo_date(value, date_only=date_only)
-                        component[prop.upper()] = vDDDTypes(parsed)
-                        logger.debug("Set %s to %s", prop.upper(), parsed)
+                # Handle completed date
+                if "completed" in todo_data:
+                    completed_str = todo_data["completed"]
+                    if completed_str:
+                        completed_dt = self._ensure_timezone_aware(completed_str)
+                        component["COMPLETED"] = vDDDTypes(completed_dt)
+                        logger.debug("Set COMPLETED to %s", completed_dt)
 
-                    # Handle completed date
-                    if "completed" in todo_data:
-                        completed_str = todo_data["completed"]
-                        if completed_str:
-                            completed_dt = self._ensure_timezone_aware(completed_str)
-                            component["COMPLETED"] = vDDDTypes(completed_dt)
-                            logger.debug("Set COMPLETED to %s", completed_dt)
+                # Handle categories
+                if "categories" in todo_data:
+                    categories_str = todo_data["categories"]
+                    if categories_str:
+                        component["CATEGORIES"] = [
+                            c.strip() for c in categories_str.split(",")
+                        ]
+                        logger.debug("Set CATEGORIES to %s", categories_str)
 
-                    # Handle categories
-                    if "categories" in todo_data:
-                        categories_str = todo_data["categories"]
-                        if categories_str:
-                            component["CATEGORIES"] = [
-                                c.strip() for c in categories_str.split(",")
-                            ]
-                            logger.debug("Set CATEGORIES to %s", categories_str)
+                # Handle reminders (VALARM)
+                self._apply_reminders(
+                    component,
+                    todo_data,
+                    todo_data.get("summary") or str(component.get("summary", "")),
+                    _TODO_REMINDER_DESCRIPTION,
+                )
 
-                    # Handle reminders (VALARM)
-                    self._apply_reminders(
-                        component,
-                        todo_data,
-                        todo_data.get("summary") or str(component.get("summary", "")),
-                        _TODO_REMINDER_DESCRIPTION,
-                    )
+                # Update timestamps
+                now = dt.datetime.now(dt.UTC)
+                component["LAST-MODIFIED"] = vDDDTypes(now)
+                component["DTSTAMP"] = vDDDTypes(now)
 
-                    # Update timestamps
-                    now = dt.datetime.now(dt.UTC)
-                    component["LAST-MODIFIED"] = vDDDTypes(now)
-                    component["DTSTAMP"] = vDDDTypes(now)
+                break
 
-                    break
-
-            return cal.to_ical().decode("utf-8")
-
-        except ValueError:
-            # A rejected update — a pairing conflict, or a date string that
-            # won't parse — is the caller's to fix. The fallback below rebuilds
-            # the todo from the *partial* update dict, so swallowing this would
-            # answer "invalid input" by silently dropping every stored property
-            # the caller didn't happen to pass, and reporting success.
-            # ``_merge_ical_properties`` dropped its identical fallback for
-            # VEVENT for exactly that reason.
-            raise
-        except Exception as e:
-            logger.error("Error merging iCal todo properties: %s", e)
-            return self._create_ical_todo(todo_data, todo_uid)
+        return cal.to_ical().decode("utf-8")
 
     # ============= Helper Methods - Filtering =============
 
@@ -3085,14 +3101,6 @@ class CalendarClient:
         except Exception as e:
             logger.warning("Error extracting categories: %s", e)
             return str(categories_obj)
-
-    def _apply_event_filters(
-        self, events: list[dict[str, Any]], filters: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        """Apply advanced filters to event list."""
-        return [
-            event for event in events if self._event_matches_filters(event, filters)
-        ]
 
     def _event_matches_filters(
         self, event: dict[str, Any], filters: dict[str, Any]
@@ -3132,9 +3140,27 @@ class CalendarClient:
                 if search_term not in location:
                     return False
 
+            # Filter by minimum duration. An event without an end is
+            # zero-length; all-day dates parse as midnight, so a one-day
+            # all-day event lasts 1440 minutes.
+            if "min_duration_minutes" in filters:
+                start = dt.datetime.fromisoformat(event["start_datetime"])
+                end = dt.datetime.fromisoformat(
+                    event.get("end_datetime") or event["start_datetime"]
+                )
+                if (end - start) < dt.timedelta(
+                    minutes=filters["min_duration_minutes"]
+                ):
+                    return False
+
             return True
 
         except Exception:
+            # Fail open: an unreadable event stays in the result rather than
+            # vanishing. Logged, since a filter bug would otherwise match all.
+            logger.warning(
+                "Event filter failed; keeping event %r", event.get("uid"), exc_info=True
+            )
             return True
 
     def _todo_matches_filters(
@@ -3170,6 +3196,10 @@ class CalendarClient:
             return True
 
         except Exception:
+            # Fail open, logged: see _event_matches_filters.
+            logger.warning(
+                "Todo filter failed; keeping todo %r", todo.get("uid"), exc_info=True
+            )
             return True
 
     # ============= Legacy Methods (for backward compatibility) =============
@@ -3236,6 +3266,7 @@ class CalendarClient:
                 start_datetime=start_datetime,
                 end_datetime=end_datetime,
                 filters=filter_criteria,
+                limit=BULK_EVENT_LIMIT,
             )
 
             targets, skipped = self._bulk_targets(events, apply_to_series, "update")
