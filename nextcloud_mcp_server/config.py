@@ -353,6 +353,17 @@ _DEFAULTS: dict[str, Any] = {
     # timing out or exhausting memory rather than failing predictably. 0
     # disables the guard.
     "webdav_write_max_mb": 50.0,
+    # Upload tickets (nc_webdav_create_upload + PUT /upload/<ticket>): binary
+    # files sent out-of-band with curl instead of base64 inside a tool call.
+    # Own cap, separate from WEBDAV_WRITE_MAX_MB because the transport differs
+    # (a raw HTTP body, not a JSON-RPC argument). 0 disables the cap.
+    "webdav_upload_max_mb": 50.0,
+    # Seconds an upload ticket stays valid after it is issued.
+    "webdav_upload_ticket_ttl_seconds": 600,
+    # Externally reachable base URL the upload link is built from (e.g.
+    # https://mcp.example.org). Falls back to NEXTCLOUD_MCP_SERVER_URL, then to
+    # the base URL of the MCP request that asked for the ticket.
+    "webdav_upload_base_url": None,
     # Transport security (MCP SDK TransportSecuritySettings). Default False
     # preserves the behaviour hardcoded before these knobs existed: MCP 1.23+
     # auto-enables localhost-only host checking, which breaks k8s/Docker service
@@ -1459,6 +1470,10 @@ class Settings:
     # Pre-flight cap (MB) on nc_webdav_write_file's content (see _DEFAULTS
     # for rationale). 0 disables the guard.
     webdav_write_max_mb: float = 50.0
+    # Upload tickets (see _DEFAULTS for rationale). 0 disables the size cap.
+    webdav_upload_max_mb: float = 50.0
+    webdav_upload_ticket_ttl_seconds: int = 600
+    webdav_upload_base_url: str | None = None
     # Transport security. See _DEFAULTS for why the protection defaults off.
     mcp_dns_rebinding_protection: bool = False
     mcp_allowed_hosts: str = ""

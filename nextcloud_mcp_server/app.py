@@ -124,6 +124,10 @@ from nextcloud_mcp_server.retry import retry_on_transient
 from nextcloud_mcp_server.server import AVAILABLE_APPS, configure_app_tools
 from nextcloud_mcp_server.server.auth_tools import register_auth_tools
 from nextcloud_mcp_server.server.oauth_tools import register_oauth_tools
+from nextcloud_mcp_server.server.webdav_upload import (
+    UPLOAD_ROUTE_PREFIX,
+    handle_upload,
+)
 
 # The vector/semantic-search stack (vector/, search/, document_processors/,
 # admin/payload_backfill, api/{visualization,vector_sync,sar}, server/{semantic,
@@ -2778,6 +2782,19 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
     routes.append(Route("/health/live", health_live, methods=["GET"]))
     routes.append(Route("/health/ready", health_ready, methods=["GET"]))
     logger.info("Health check endpoints enabled: /health/live, /health/ready")
+
+    # One-time upload tickets for nc_webdav_create_upload. Deliberately outside
+    # the MCP mount and its bearer auth: the unguessable single-use ticket in the
+    # path is the credential, and the write runs with the Nextcloud client of
+    # the user who requested the ticket (server/webdav_upload.py).
+    routes.append(
+        Route(
+            f"{UPLOAD_ROUTE_PREFIX}{{ticket}}",
+            handle_upload,
+            methods=["PUT"],
+        )
+    )
+    logger.info("Upload ticket endpoint enabled: PUT %s{ticket}", UPLOAD_ROUTE_PREFIX)
 
     # Add Nextcloud webhook receiver (queues DocumentTasks for vector sync).
     # Implementation lives in vector/webhook_receiver.py; the handler reads

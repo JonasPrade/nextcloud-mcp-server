@@ -7,6 +7,7 @@
 | `nc_webdav_list_directory` | List files and directories in any NextCloud path |
 | `nc_webdav_read_file` | Read file content (documents extracted to text/markdown, text decoded, other binary as base64) |
 | `nc_webdav_write_file` | Create or update files in NextCloud |
+| `nc_webdav_create_upload` | Get a one-time upload URL to send a (binary) file out of band, without base64 |
 | `nc_webdav_create_directory` | Create new directories |
 | `nc_webdav_delete_resource` | Delete files or directories |
 | `nc_webdav_move_resource` | Move or rename files and directories |
@@ -155,6 +156,96 @@ argument — there is no chunked/streaming upload for writes (unlike the
 read/ingest path). A pre-flight size gate rejects content over
 `WEBDAV_WRITE_MAX_MB` (default 50, `0` disables) with a clear error rather
 than risking a timeout or out-of-memory failure on a very large PUT.
+
+## Upload Tickets for Binary Files
+
+`nc_webdav_write_file` takes the file as a tool argument, so binary content has
+to travel base64-encoded through the model's context. Beyond a few KB that is
+impractical: a 240 KB PDF or a 2 MB Word document does not fit sensibly into
+one call. When the file already exists in the client's sandbox, use an upload
+ticket instead and send the bytes directly over HTTP:
+
+1. Call `nc_webdav_create_upload` with the target `path`, the file's `size` in
+   bytes and its hex `sha256` (plus optional `if_match` and `content_type`).
+2. The tool returns `upload_url`, a ready `curl` command, `expires_in` and
+   `path`.
+3. Send the file:
+   `curl --fail-with-body -sS -X PUT --data-binary @Urkunde.pdf "<upload_url>"`
+4. The server checks size and SHA-256 and writes the file to Nextcloud via
+   WebDAV, with the credentials of the user who requested the ticket.
+
+```python
+# size = stat -c %s Urkunde.pdf, sha256 = sha256sum Urkunde.pdf
+ticket = await nc_webdav_create_upload(
+    path="Vorstand/11 Bescheinigungen/Urkunde.pdf",
+    size=245_760,
+    sha256="9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+)
+# then, in the sandbox: run ticket["curl"] with <file> replaced by the local path
+```
+
+`if_match` works exactly as for `nc_webdav_write_file`: omit it to create a new
+file only, pass an etag to replace the file only if it is unchanged, or pass
+`"*"` to force-overwrite an existing file. The tool already refuses a ticket
+that is certain to fail (target folder missing, file exists without
+`if_match`, `"*"` for a missing file), so no bytes are sent in vain. The
+conditional PUT remains the authoritative check.
+
+### The ticket
+
+- 32 random bytes in the URL path, valid for `WEBDAV_UPLOAD_TICKET_TTL_SECONDS`
+  (default 600) and for **one attempt**: the first PUT consumes it whatever the
+  outcome, so request a new ticket after an error.
+- Bound to `path`, `size`, `sha256`, `if_match` and the Nextcloud user who
+  requested it. The PUT carries no other credential. The write uses that user's
+  client (BasicAuth, Login Flow v2 app password or OAuth token, as for every
+  other tool), never a service account.
+- Held in process memory: tickets do not survive a restart and are not shared
+  between replicas. Several replicas behind one URL need sticky routing for
+  `/upload/*`, or a single replica.
+- At most 20 open tickets per user.
+
+### The upload endpoint: `PUT /upload/{ticket}`
+
+Checks run in this order, and nothing is written unless all pass:
+
+| Status | `error` | Meaning |
+|--------|---------|---------|
+| 404 | `ticket_not_found` | Unknown ticket |
+| 410 | `ticket_expired` / `ticket_used` | Ticket expired or already used |
+| 413 | `too_large` | Body exceeds `WEBDAV_UPLOAD_MAX_MB` |
+| 422 | `size_mismatch` | `Content-Length` or the bytes received differ from `size` (checked before the body is read, and aborted as soon as more bytes arrive) |
+| 422 | `hash_mismatch` | SHA-256 of the body differs from `sha256` |
+| 403 | `excluded` | Target or a parent folder carries an `EXCLUDED_TAGS` tag (re-checked at upload time) |
+| 409 | `parent_missing` | The target folder does not exist |
+| 412 | `precondition_failed` | `if_match` precondition failed (file exists, changed, or is missing for `"*"`) |
+| 423 | `locked` | File is locked, e.g. open in the web editor |
+| 403 / 507 / 502 | `nextcloud_denied` / `insufficient_storage` / `nextcloud_error` | Nextcloud refused or failed the write |
+
+Every error body is `{"error": "...", "reason": "..."}`. On success (201 for a
+new file, 200 for a replaced one) the body is:
+
+```json
+{"path": "Vorstand/11 Bescheinigungen/Urkunde.pdf", "size": 245760,
+ "etag": "\"6a1f...\"", "created": true,
+ "url": "https://cloud.example.org/index.php/f/4711"}
+```
+
+`url` opens the file in Nextcloud. It is `null` when no browser-reachable
+Nextcloud URL is configured.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WEBDAV_UPLOAD_MAX_MB` | `50` | Size cap for ticketed uploads, separate from `WEBDAV_WRITE_MAX_MB`. `0` disables the cap. The body is buffered in memory until the hash is verified. |
+| `WEBDAV_UPLOAD_TICKET_TTL_SECONDS` | `600` | Ticket lifetime |
+| `WEBDAV_UPLOAD_BASE_URL` | unset | Externally reachable base URL for upload links, e.g. `https://mcp.example.org`. Falls back to `NEXTCLOUD_MCP_SERVER_URL`, then to the base URL of the MCP request. Set it when the server sits behind a reverse proxy that does not forward the public scheme and host. |
+
+The endpoint needs the HTTP transport. Under stdio the tool refuses and points
+to `nc_webdav_write_file`. Make sure a reverse proxy in front of the server
+allows request bodies up to `WEBDAV_UPLOAD_MAX_MB` on `/upload/` (nginx:
+`client_max_body_size`).
 
 ## Conditional move and copy
 
