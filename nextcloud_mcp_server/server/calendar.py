@@ -601,7 +601,7 @@ def configure_calendar_tools(mcp: MCPServer):
             current = None
             try:
                 current, _ = await client.calendar.get_event(calendar_name, event_uid)
-            except (httpx.HTTPError, ValueError) as read_error:
+            except (httpx2.HTTPError, ValueError) as read_error:
                 logger.debug("Could not read %s after 412: %s", event_uid, read_error)
             raise _stale_event_etag_error(event_uid, e, current) from e
         return _event_write_response(calendar_name, result)

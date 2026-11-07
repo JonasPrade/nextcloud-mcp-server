@@ -1,8 +1,9 @@
 """Mocked unit tests for the Polls client and its models.
 
 What these pin down is the behaviour the rest of the codebase cannot see: that
-the OCS envelope is unwrapped, that ``OCS-APIRequest`` goes out on every call
-(without it Nextcloud answers 997, not a 4xx), that Polls' "0 means unset"
+the OCS envelope is unwrapped, that the OCS JSON ``Accept`` header goes out on
+every call (``OCS-APIRequest`` itself is a client default, see
+``http.NEXTCLOUD_DEFAULT_HEADERS``), that Polls' "0 means unset"
 timestamps become ``None``, that date options are rendered in the poll's own
 timezone, and that the tally sorts by approval.
 """
@@ -10,7 +11,7 @@ timezone, and that the tally sorts by approval.
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import httpx
+import httpx2
 import pytest
 
 from nextcloud_mcp_server.client.polls import PollsClient, iso_duration
@@ -51,7 +52,7 @@ def _client(mocker, json_data):
         "_make_request",
         return_value=create_mock_response(status_code=200, json_data=json_data),
     )
-    client = PollsClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = PollsClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
     return client, mock_make_request
 
 
@@ -142,7 +143,7 @@ async def test_list_polls_unwraps_envelope_and_sends_ocs_headers(mocker):
     mock_make_request.assert_called_once_with(
         "GET",
         f"{API}/polls",
-        headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+        headers={"Accept": "application/json"},
         params={"format": "json"},
     )
 
@@ -197,18 +198,18 @@ async def test_invalid_poll_id_never_reaches_the_wire(mocker, bad_id):
 
 
 async def test_http_error_propagates(mocker):
-    request = httpx.Request("GET", f"https://nc.example{API}/poll/99")
-    response = httpx.Response(404, request=request)
+    request = httpx2.Request("GET", f"https://nc.example{API}/poll/99")
+    response = httpx2.Response(404, request=request)
     mocker.patch.object(
         PollsClient,
         "_make_request",
-        side_effect=httpx.HTTPStatusError(
+        side_effect=httpx2.HTTPStatusError(
             "not found", request=request, response=response
         ),
     )
-    client = PollsClient(mocker.AsyncMock(spec=httpx.AsyncClient), "testuser")
+    client = PollsClient(mocker.AsyncMock(spec=httpx2.AsyncClient), "testuser")
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(httpx2.HTTPStatusError):
         await client.get_poll(99)
 
 
