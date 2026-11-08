@@ -14,7 +14,9 @@ concurrency:
 
 jobs:
   bump-version:
-    if: "!startsWith(github.event.head_commit.message, 'bump:') && !startsWith(github.event.head_commit.message, 'chore(release):')"
+    # Fork guard: the bump feeds release.yml, docker-build-publish.yml and
+    # pact-record-deployment.yml, which publish as the original project.
+    if: "github.repository == 'cbcoutinho/nextcloud-mcp-server' && !startsWith(github.event.head_commit.message, 'bump:') && !startsWith(github.event.head_commit.message, 'chore(release):')"
     runs-on: ubuntu-latest
     name: "Bump version and create changelog"
     permissions:
