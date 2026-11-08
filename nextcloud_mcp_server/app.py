@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib
 import json
 import logging
 import os
 import time
 import traceback
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -15,16 +16,20 @@ from urllib.parse import quote, urlparse
 
 import anyio
 import click
-import httpx
+import httpx2
 from anyio.abc import TaskGroup
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.httpx import (
+    HTTPX2ClientInstrumentor,
+    HTTPXClientInstrumentor,
+)
 from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import (
@@ -51,6 +56,7 @@ from nextcloud_mcp_server.api import (
     revoke_user_access,
     update_user_scopes,
 )
+from nextcloud_mcp_server.api.passwords import _validate_nextcloud_credentials
 from nextcloud_mcp_server.auth import (
     InsufficientScopeError,
     discover_all_scopes,
@@ -97,7 +103,6 @@ from nextcloud_mcp_server.config_validators import (
     get_mode_summary,
     validate_configuration,
 )
-from nextcloud_mcp_server.context import get_client as get_nextcloud_client
 from nextcloud_mcp_server.errors import NextcloudMCPServer
 from nextcloud_mcp_server.features import semantic_installed
 from nextcloud_mcp_server.http import nextcloud_httpx_client
@@ -119,15 +124,19 @@ from nextcloud_mcp_server.plugins import (
     plugin_routes,
     register_plugin_tools,
 )
-from nextcloud_mcp_server.request_context import current_context
 from nextcloud_mcp_server.retry import retry_on_transient
-from nextcloud_mcp_server.server import AVAILABLE_APPS, configure_app_tools
+from nextcloud_mcp_server.server import (
+    AVAILABLE_APPS,
+    configure_app_tools,
+    configure_capabilities_resource,
+)
 from nextcloud_mcp_server.server.auth_tools import register_auth_tools
 from nextcloud_mcp_server.server.oauth_tools import register_oauth_tools
 from nextcloud_mcp_server.server.webdav_upload import (
     UPLOAD_ROUTE_PREFIX,
     handle_upload,
 )
+from nextcloud_mcp_server.utils.parsing import split_csv
 
 # The vector/semantic-search stack (vector/, search/, document_processors/,
 # admin/payload_backfill, api/{visualization,vector_sync,sar}, server/{semantic,
@@ -145,7 +154,8 @@ if TYPE_CHECKING:
     from nextcloud_mcp_server.vector.queue import IngestTransport, TaskProducer
 
 logger = logging.getLogger(__name__)
-HTTPXClientInstrumentor().instrument()
+HTTPX2ClientInstrumentor().instrument()  # our clients, mcp, openai, mistralai
+HTTPXClientInstrumentor().instrument()  # qdrant-client and huggingface-hub still use httpx
 
 
 def build_dcr_scopes(
@@ -615,7 +625,7 @@ async def _check_qdrant_health() -> None:
         probe_url = f"{qdrant_url}/collections/{quote(collection, safe='')}"
         probe_desc = f"collection {collection}"
 
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with httpx2.AsyncClient(timeout=2.0) as client:
             response = await client.get(probe_url, headers=headers)
         healthy = response.status_code == 200
         # Keep the healthy detail exactly "ok" — the control plane's rotate-verify
@@ -639,7 +649,7 @@ def _qdrant_init_error_is_transient(exc: BaseException) -> bool:
     network-policy convergence), which is worth retrying. A genuine
     misconfiguration (bad URL/API key surfacing as a 4xx) is not transient and
     should fail fast. Transient signals, mirroring the OIDC-discovery split:
-    connection-level failures — ``httpx.TransportError`` (raw) or qdrant's
+    connection-level failures — ``httpx2.TransportError`` (raw) or qdrant's
     ``ResponseHandlingException`` (wrapper) — and a ``5xx`` from a reachable but
     overloaded/starting Qdrant (qdrant's ``UnexpectedResponse.status_code``). A
     ``4xx`` (auth/URL) is not transient. Walks the ``__cause__``/``__context__``
@@ -650,7 +660,7 @@ def _qdrant_init_error_is_transient(exc: BaseException) -> bool:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if type(current).__name__ == "ResponseHandlingException" or isinstance(
-            current, httpx.TransportError
+            current, httpx2.TransportError
         ):
             return True
         # qdrant's UnexpectedResponse carries the HTTP status: 5xx is a transient
@@ -805,19 +815,70 @@ class OAuthAppContext:
         return _vector_sync_state.eviction_task_group
 
 
+def _auth_scheme(auth_header: str) -> str:
+    """The Authorization scheme, safe to log; never any credential material.
+
+    Only known schemes are echoed: a header without one may be a bare token, and
+    its first word would then be the secret itself.
+    """
+    scheme = auth_header.split(" ", 1)[0]
+    return scheme if scheme.lower() in ("basic", "bearer") else "<other>"
+
+
 class BasicAuthMiddleware:
-    """Middleware to extract BasicAuth credentials from Authorization header.
+    """Middleware to extract and verify BasicAuth credentials.
 
     For multi-user BasicAuth pass-through mode, this middleware extracts
-    username/password from the Authorization: Basic header and stores them
-    in the request state for use by the context layer.
+    username/password from the Authorization: Basic header, verifies them
+    against Nextcloud, and stores them in the request state for use by the
+    context layer.
 
-    The credentials are NOT stored persistently - they are passed through
-    directly to Nextcloud APIs for each request (stateless).
+    Verification happens here, once, before any handler runs: some handlers
+    serve server-side state keyed by the username without themselves calling
+    Nextcloud, so they cannot be relied on to reject a bad credential. A
+    failed check is rejected with 401 (or 502 when Nextcloud is unreachable) —
+    fail closed.
+
+    The credentials are NOT stored persistently. A successful check is
+    remembered for ``_VALID_TTL`` seconds, keyed by a hash of the header, so
+    each request doesn't cost a Nextcloud round-trip. Failures are not cached:
+    a negative cache only dedupes an identical bad header, not varied guesses,
+    and before this check every bad tool call already reached Nextcloud, whose
+    brute-force protection remains the throttle.
     """
+
+    # ponytail: a revoked password stays accepted for up to this long; lower it
+    # if revocation latency matters more than one OCS call per request.
+    _VALID_TTL = 60.0
+    _PRUNE_AT = 256
 
     def __init__(self, app: ASGIApp):
         self.app = app
+        self._validated: dict[bytes, float] = {}
+
+    async def _verify(
+        self, auth_header: bytes, username: str, password: str
+    ) -> JSONResponse | None:
+        """Return ``None`` if the credential is valid, else the error response."""
+        key = hashlib.sha256(auth_header).digest()
+        now = time.monotonic()
+        if self._validated.get(key, 0.0) > now:
+            return None
+
+        _, error = await _validate_nextcloud_credentials(
+            get_settings().nextcloud_host or "",
+            username,
+            password,
+            invalid_credential_error="Invalid credentials",
+        )
+        if error is not None:
+            return error
+
+        # Drop expired entries so the map is bounded by recently-active users.
+        if len(self._validated) >= self._PRUNE_AT:
+            self._validated = {k: t for k, t in self._validated.items() if t > now}
+        self._validated[key] = now + self._VALID_TTL
+        return None
 
     async def __call__(
         self, scope: StarletteScope, receive: Receive, send: Send
@@ -833,18 +894,27 @@ class BasicAuthMiddleware:
                     encoded = auth_header[6:]  # Skip "Basic "
                     decoded = base64.b64decode(encoded).decode("utf-8")
                     username, password = decoded.split(":", 1)
-
-                    # Store in request state
-                    scope.setdefault("state", {})
-                    scope["state"]["basic_auth"] = {
-                        "username": username,
-                        "password": password,
-                    }
-                    logger.debug(
-                        "BasicAuth credentials extracted for user: %s", username
-                    )
                 except Exception as e:
                     logger.warning("Failed to extract BasicAuth credentials: %s", e)
+                    error = JSONResponse(
+                        {"success": False, "error": "Malformed credentials"},
+                        status_code=401,
+                    )
+                else:
+                    error = await self._verify(auth_header, username, password)
+
+                if error is not None:
+                    error.headers["WWW-Authenticate"] = 'Basic realm="nextcloud"'
+                    await error(scope, receive, send)
+                    return
+
+                # Store in request state
+                scope.setdefault("state", {})
+                scope["state"]["basic_auth"] = {
+                    "username": username,
+                    "password": password,
+                }
+                logger.debug("BasicAuth credentials extracted for user: %s", username)
 
         await self.app(scope, receive, send)
 
@@ -959,7 +1029,7 @@ async def load_oauth_client_credentials(
 
 
 @asynccontextmanager
-async def app_lifespan_basic(server: MCPServer) -> AsyncIterator[AppContext]:
+async def app_lifespan_basic(server: MCPServer) -> AsyncGenerator[AppContext]:
     """
     Manage application lifecycle for BasicAuth mode (MCPServer session lifespan).
 
@@ -1028,7 +1098,7 @@ async def app_lifespan_basic(server: MCPServer) -> AsyncIterator[AppContext]:
 def _oidc_discovery_error_is_transient(exc: BaseException) -> bool:
     """Whether an OIDC-discovery failure is worth retrying.
 
-    ``httpx.RequestError`` is the broad network-layer base (transport
+    ``httpx2.RequestError`` is the broad network-layer base (transport
     timeouts/connection errors plus TooManyRedirects, DecodingError, …), and a
     malformed 200 body — e.g. a proxy/gateway "warming up" HTML placeholder
     served during cold start — raises ``JSONDecodeError``. Both are transient
@@ -1038,7 +1108,7 @@ def _oidc_discovery_error_is_transient(exc: BaseException) -> bool:
     A 4xx is a misconfiguration (wrong URL, no OIDC app), so it fails fast and
     the operator sees the real error instead of a retry storm.
     """
-    if isinstance(exc, httpx.HTTPStatusError):
+    if isinstance(exc, httpx2.HTTPStatusError):
         return 500 <= exc.response.status_code < 600
     return True
 
@@ -1060,12 +1130,12 @@ async def _perform_oidc_discovery(
     responses are treated as transient and retried. A 4xx response is a
     configuration error, not a transient condition, so it is raised immediately.
 
-    ``timeout`` overrides the per-attempt httpx timeout (seconds); ``None`` keeps
-    httpx's default. The hybrid multi-user-basic path passes an explicit,
+    ``timeout`` overrides the per-attempt httpx2 timeout (seconds); ``None`` keeps
+    httpx2's default. The hybrid multi-user-basic path passes an explicit,
     longer budget here so it keeps its original per-attempt timeout while also
     gaining the retries.
     """
-    # Pass timeout through only when set — httpx treats an explicit
+    # Pass timeout through only when set — httpx2 treats an explicit
     # timeout=None as "disable timeout" rather than "use the default".
     client_kwargs: dict[str, Any] = {"follow_redirects": True}
     if timeout is not None:
@@ -1076,7 +1146,7 @@ async def _perform_oidc_discovery(
     # gte=1/gte=0 dynaconf validators, and a negative backoff would otherwise
     # flip random.uniform(0, delay) into a reversed range.
     @retry_on_transient(
-        (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError),
+        (httpx2.RequestError, httpx2.HTTPStatusError, json.JSONDecodeError),
         should_retry=_oidc_discovery_error_is_transient,
         provider_name="OIDC discovery",
         label="transient error",
@@ -1365,7 +1435,7 @@ async def setup_oauth_config_for_multi_user_basic(
 
     Raises:
         ValueError: If NEXTCLOUD_HOST is not set
-        httpx.HTTPError: If OIDC discovery fails
+        httpx2.HTTPError: If OIDC discovery fails
     """
     nextcloud_host = settings.nextcloud_host
     if not nextcloud_host:
@@ -1392,7 +1462,7 @@ async def setup_oauth_config_for_multi_user_basic(
     # subclass) all fall through to the handlers below.
     try:
         discovery = await _perform_oidc_discovery(discovery_url, settings, timeout=30.0)
-    except httpx.HTTPStatusError as e:
+    except httpx2.HTTPStatusError as e:
         logger.error(
             "OIDC discovery failed: HTTP %s from %s",
             e.response.status_code,
@@ -1402,7 +1472,7 @@ async def setup_oauth_config_for_multi_user_basic(
             f"OIDC discovery failed: HTTP {e.response.status_code} from {discovery_url}. "
             "Ensure Nextcloud OIDC (user_oidc app) is installed and configured."
         ) from e
-    except httpx.RequestError as e:
+    except httpx2.RequestError as e:
         logger.error("OIDC discovery failed: %s", e)
         raise ValueError(
             f"OIDC discovery failed: Cannot connect to {discovery_url}. Error: {e}"
@@ -1497,11 +1567,6 @@ async def setup_oauth_config_for_multi_user_basic(
     return (token_verifier, refresh_token_storage, client_id, client_secret)
 
 
-def _csv_setting(raw: str) -> list[str]:
-    """Split a comma-separated setting into a list, dropping blanks."""
-    return [item.strip() for item in raw.split(",") if item.strip()]
-
-
 #: Room for the JSON-RPC envelope around a maximum-size `nc_webdav_write_file`
 #: argument: method, id, path, content_type, and the quoting of the base64 blob.
 _REQUEST_ENVELOPE_SLACK = 1024 * 1024
@@ -1542,8 +1607,8 @@ def _build_transport_security() -> TransportSecuritySettings:
     """
     settings = get_settings()
     enabled = settings.mcp_dns_rebinding_protection
-    hosts = _csv_setting(settings.mcp_allowed_hosts)
-    origins = _csv_setting(settings.mcp_allowed_origins)
+    hosts = split_csv(settings.mcp_allowed_hosts)
+    origins = split_csv(settings.mcp_allowed_origins)
 
     if not enabled and (hosts or origins):
         logger.warning(
@@ -1770,9 +1835,9 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 logger.info(
                     "✓ OAuth infrastructure setup complete for multi-user BasicAuth hybrid mode"
                 )
-            except (httpx.HTTPError, ValueError, KeyError) as e:
+            except (httpx2.HTTPError, ValueError, KeyError) as e:
                 # Expected errors during OAuth infrastructure setup:
-                # - httpx.HTTPError: Network issues, OIDC discovery failures
+                # - httpx2.HTTPError: Network issues, OIDC discovery failures
                 # - ValueError: Missing required configuration (NEXTCLOUD_HOST)
                 # - KeyError: Missing required fields in OIDC discovery response
                 logger.error("Failed to setup OAuth infrastructure: %s", e)
@@ -1810,7 +1875,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
 
         # Create lifespan function with captured OAuth context (closure)
         @asynccontextmanager
-        async def oauth_lifespan(server: MCPServer) -> AsyncIterator[OAuthAppContext]:
+        async def oauth_lifespan(server: MCPServer) -> AsyncGenerator[OAuthAppContext]:
             """
             Lifespan context for OAuth mode - captures OAuth configuration from outer scope.
             """
@@ -1881,12 +1946,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             lifespan=app_lifespan_basic,
         )
 
-    @mcp.resource("nc://capabilities")
-    async def nc_get_capabilities():
-        """Get the Nextcloud Host capabilities"""
-        ctx = current_context(mcp)
-        client = await get_nextcloud_client(ctx)
-        return await client.capabilities()
+    configure_capabilities_resource(mcp)
 
     # If no specific apps are specified, enable all
     if enabled_apps is None:
@@ -2479,7 +2539,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
 
                 # Store token broker in oauth_context for management API (revoke endpoint)
                 if hasattr(app.state, "oauth_context"):
-                    app.state.oauth_context["token_broker"] = token_broker  # ty: ignore[invalid-assignment]  # Starlette app.state bag is heterogeneous; the inferred value union is too narrow
+                    app.state.oauth_context["token_broker"] = token_broker
                     logger.info(
                         "Token broker added to oauth_context for management API"
                     )
@@ -3189,16 +3249,14 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         app.state.supported_scopes = discover_all_scopes(mcp)
 
     # Add debugging middleware to log Authorization headers and client capabilities
-    @app.middleware("http")
     async def log_auth_headers(request, call_next):
         auth_header = request.headers.get("authorization")
         if request.url.path.startswith("/mcp"):
             if auth_header:
-                # Log first 50 chars of token for debugging
-                token_preview = (
-                    auth_header[:50] + "..." if len(auth_header) > 50 else auth_header
+                logger.debug(
+                    "🔑 /mcp request with Authorization scheme: %s",
+                    _auth_scheme(auth_header),
                 )
-                logger.info("🔑 /mcp request with Authorization: %s", token_preview)
             else:
                 # Only warn about missing Authorization in OAuth mode
                 # In BasicAuth mode, /mcp requests without Authorization are expected
@@ -3256,12 +3314,13 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
         response = await call_next(request)
         return response
 
+    app.add_middleware(BaseHTTPMiddleware, dispatch=log_auth_headers)  # type: ignore[invalid-argument-type]
+
     # Log the inbound User-Agent on management API and webhook receiver routes
     # so we can tell which Astrolabe (or other PHP-side client) build is
     # talking to the backend. Astrolabe sends ``Nextcloud-Astrolabe/<version>``.
     _UA_LOGGED_PATH_PREFIXES = ("/api/v1/", "/webhooks/nextcloud")
 
-    @app.middleware("http")
     async def log_client_user_agent(request, call_next):
         path = request.url.path
         if path.startswith(_UA_LOGGED_PATH_PREFIXES):
@@ -3279,6 +3338,8 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
             )
         return await call_next(request)
 
+    app.add_middleware(BaseHTTPMiddleware, dispatch=log_client_user_agent)  # type: ignore[invalid-argument-type]
+
     # Add CORS middleware to allow browser-based clients like MCP Inspector.
     #
     # The default is still "*", so behaviour is unchanged — but it is now a
@@ -3289,7 +3350,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
     # so *any* origin may send credentialed requests. Fine behind a private
     # network or for local Inspector use; not something to leave unexamined on a
     # server reachable from a browser.
-    cors_origins = _csv_setting(get_settings().cors_allow_origins)
+    cors_origins = split_csv(get_settings().cors_allow_origins)
     if "*" in cors_origins:
         logger.warning(
             "CORS allows any origin with credentials (CORS_ALLOW_ORIGINS='*'). "
@@ -3313,9 +3374,9 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
     # Add exception handler for scope challenges (OAuth mode only)
     if oauth_enabled:
 
-        @app.exception_handler(InsufficientScopeError)
-        async def handle_insufficient_scope(request, exc: InsufficientScopeError):
+        def handle_insufficient_scope(request, exc: Exception):
             """Return 403 with WWW-Authenticate header for scope challenges."""
+            assert isinstance(exc, InsufficientScopeError)  # registered for this type
             resource_url = (
                 settings.nextcloud_mcp_server_url or _default_mcp_server_url()
             )
@@ -3336,6 +3397,7 @@ def get_app(transport: str = "streamable-http", enabled_apps: list[str] | None =
                 },
             )
 
+        app.add_exception_handler(InsufficientScopeError, handle_insufficient_scope)
         logger.info("WWW-Authenticate scope challenge handler enabled")
 
     # Apply BasicAuthMiddleware for multi-user BasicAuth pass-through mode

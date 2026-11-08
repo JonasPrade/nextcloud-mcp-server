@@ -3,18 +3,18 @@ from collections.abc import Sequence
 from email.utils import parsedate_to_datetime
 
 import anyio
-from httpx import (
+from httpx2 import (
     AsyncBaseTransport,
-    AsyncClient,
     Auth,
     BasicAuth,
     Request,
+    RequestNotRead,
     Response,
     Timeout,
 )
 
 from ..controllers.notes_search import NotesSearchController
-from ..http import nextcloud_httpx_transport
+from ..http import nextcloud_httpx_client, nextcloud_httpx_transport
 from .base import STREAMING_REQUEST_EXTENSION
 from .calendar import CalendarClient
 from .collectives import CollectivesClient
@@ -37,13 +37,27 @@ from .webdav import WebDAVClient
 logger = logging.getLogger(__name__)
 
 
-async def log_request(request: Request):
+async def log_request(request: Request) -> None:
+    """Log the outgoing request at DEBUG, without touching a streamed body.
+
+    httpx2 only buffers a request body up front when it is given as bytes, str,
+    form data or JSON. For a streamed body (an async iterable, or multipart
+    ``files=``) ``request.content`` raises ``RequestNotRead`` instead. It used
+    to be evaluated as a log argument even with DEBUG off, so any such request
+    on the shared client would fail in this hook before it was sent.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
     logger.debug(
         "Request event hook: %s %s - Waiting for content",
         request.method,
         request.url,
     )
-    logger.debug("Request body: %s", request.content)
+    try:
+        body: object = request.content
+    except RequestNotRead:
+        body = "<streaming; body not read>"
+    logger.debug("Request body: %s", body)
     logger.debug("Headers: %s", request.headers)
 
 
@@ -56,7 +70,7 @@ async def log_response(response: Response):
     1. ``aread()`` ran **unconditionally**, while only the logging was gated by
        DEBUG. Every response in the app was therefore fully buffered and
        stringified regardless of log level, purely to serve a line nobody saw.
-    2. httpx invokes response hooks BEFORE the body is fetched, so on a streamed
+    2. httpx2 invokes response hooks BEFORE the body is fetched, so on a streamed
        GET that ``aread()`` pulled the whole document into memory and left the
        caller's ``aiter_bytes()`` loop with nothing to stream. A 1 GB ingest
        download became a 1 GB buffer plus its decoded ``.text`` copy -- ~3.6x the
@@ -126,9 +140,9 @@ def _normalise_search_result(item: dict) -> dict:
 
 
 class AsyncDisableCookieTransport(AsyncBaseTransport):
-    """This Transport disable cookies from accumulating in the httpx AsyncClient
+    """This Transport disable cookies from accumulating in the httpx2 AsyncClient
 
-    Thanks to: https://github.com/encode/httpx/issues/2992#issuecomment-2133258994
+    Thanks to: https://github.com/encode/httpx2/issues/2992#issuecomment-2133258994
     """
 
     def __init__(self, transport: AsyncBaseTransport):
@@ -160,11 +174,11 @@ class NextcloudClient:
         # loginName), which differs from the UID for OIDC-provisioned users.
         # Defaults to ``username`` so single-user and OAuth modes are unchanged.
         # Callers pass the matching ``auth=BasicAuth(auth_username, ...)`` for
-        # the httpx leg; ``auth_username`` is threaded to the CalDAV client,
+        # the httpx2 leg; ``auth_username`` is threaded to the CalDAV client,
         # which builds its own auth object from the raw credential.
         self.username = username
         auth_username = auth_username or username
-        self._client = AsyncClient(
+        self._client = nextcloud_httpx_client(
             base_url=base_url,
             auth=auth,
             transport=AsyncDisableCookieTransport(nextcloud_httpx_transport()),
@@ -178,7 +192,7 @@ class NextcloudClient:
         self.tables = TablesClient(self._client, username)
         # CalendarClient takes raw credentials so caldav (which uses niquests as
         # its preferred backend in v3.x) builds a backend-compatible auth object
-        # itself — passing httpx.BasicAuth here breaks under niquests (#731).
+        # itself — passing httpx2.BasicAuth here breaks under niquests (#731).
         self.calendar = CalendarClient(
             base_url,
             username,

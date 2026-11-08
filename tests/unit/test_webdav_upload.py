@@ -3,7 +3,7 @@
 Three layers, each with the Nextcloud side mocked:
 
 * ``UploadTicketStore`` -- single use, expiry, tombstones, per-user caps.
-* ``handle_upload`` -- driven through a real Starlette app over httpx's ASGI
+* ``handle_upload`` -- driven through a real Starlette app over httpx2's ASGI
   transport, so Content-Length handling and body streaming are exercised as an
   HTTP client would hit them.
 * the MCP tool -- argument validation, preflight and the ticket it issues.
@@ -13,8 +13,10 @@ import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import httpx
+import httpx2
 import pytest
+from hypothesis import assume, given
+from hypothesis import strategies as st
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from starlette.applications import Starlette
@@ -129,10 +131,10 @@ def _issue(store: UploadTicketStore, client, **overrides) -> str:
     return token
 
 
-def _http() -> httpx.AsyncClient:
+def _http() -> httpx2.AsyncClient:
     app = Starlette(routes=[Route("/upload/{ticket}", handle_upload, methods=["PUT"])])
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://mcp.test"
+    return httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://mcp.test"
     )
 
 
@@ -204,11 +206,33 @@ def test_per_user_ticket_cap(store):
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
-def test_normalize_sha256():
-    assert normalize_sha256(DIGEST.upper()) == DIGEST
-    assert normalize_sha256(f"  {DIGEST}\n") == DIGEST
-    assert normalize_sha256("abc") is None
-    assert normalize_sha256("z" * 64) is None
+@st.composite
+def presented_digests(draw) -> tuple[str, str]:
+    """A real digest as a caller might paste it, and its canonical form.
+
+    Mixed case and surrounding whitespace (``sha256sum`` output ends in a
+    newline) are presentation, not content, so both must normalise away.
+    """
+    digest = hashlib.sha256(draw(st.binary(max_size=64))).hexdigest()
+    cased = "".join(c.upper() if draw(st.booleans()) else c for c in digest)
+    pad = st.text(alphabet=" \t\n", max_size=3)
+    return draw(pad) + cased + draw(pad), digest
+
+
+@given(presented_digests())
+def test_normalize_sha256_accepts_any_presentation_of_a_digest(case):
+    presented, expected = case
+    assert normalize_sha256(presented) == expected
+
+
+@given(st.text(max_size=80))
+def test_normalize_sha256_rejects_anything_but_64_hex_digits(value):
+    stripped = value.strip()
+    is_digest = len(stripped) == 64 and all(
+        c in "0123456789abcdefABCDEF" for c in stripped
+    )
+    assume(not is_digest)
+    assert normalize_sha256(value) is None
 
 
 @pytest.mark.parametrize(
@@ -443,9 +467,9 @@ async def test_upload_nextcloud_http_errors(
 ):
     s, _ = store
     client = _fake_client()
-    request = httpx.Request("PUT", "http://nc/remote.php/dav/files/alice/x")
-    client.webdav.write_file.side_effect = httpx.HTTPStatusError(
-        "boom", request=request, response=httpx.Response(nc_status, request=request)
+    request = httpx2.Request("PUT", "http://nc/remote.php/dav/files/alice/x")
+    client.webdav.write_file.side_effect = httpx2.HTTPStatusError(
+        "boom", request=request, response=httpx2.Response(nc_status, request=request)
     )
     token = _issue(s, client)
 
@@ -628,7 +652,7 @@ async def test_tool_preflight_is_fail_open(
 ):
     """A PROPFIND that errors must not block the ticket: the PUT decides."""
     client = _fake_client()
-    client.webdav.get_fileid = AsyncMock(side_effect=httpx.ConnectError("down"))
+    client.webdav.get_fileid = AsyncMock(side_effect=httpx2.ConnectError("down"))
     patch_get_client(client)
     result = await create_upload(
         path="Vorstand/Urkunde.pdf", size=1, sha256=DIGEST, ctx=_ctx()

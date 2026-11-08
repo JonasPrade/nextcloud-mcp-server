@@ -33,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from httpx import HTTPError, HTTPStatusError
+from httpx2 import HTTPError, HTTPStatusError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -437,9 +437,11 @@ async def handle_upload(request: Request) -> JSONResponse:
         # write already happened and must not be reported as failed.
         try:
             url = file_url(browser_base, await client.webdav.get_fileid(ticket.path))
-        except Exception as e:
+        except Exception:
             logger.debug(
-                "No file link for %r: fileid lookup failed: %s", ticket.path, e
+                "No file link for %r: fileid lookup failed",
+                ticket.path,
+                exc_info=True,
             )
 
     created = status_code == 201

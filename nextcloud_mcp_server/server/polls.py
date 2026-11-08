@@ -15,13 +15,13 @@ that opens the poll.
 """
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from httpx import HTTPStatusError, RequestError, Response
+from httpx2 import HTTPStatusError, RequestError, Response
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.shared.exceptions import MCPError
 from mcp.types import ToolAnnotations
@@ -115,7 +115,7 @@ def _http_failure(status: int, reason: str | None) -> str:
 
 
 @contextmanager
-def _polls_errors(action: str) -> Iterator[None]:
+def _polls_errors(action: str) -> Generator[None]:
     """Re-raise a Polls failure as the message the model should act on."""
     try:
         yield

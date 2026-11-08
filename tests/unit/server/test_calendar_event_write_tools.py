@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from httpx import Request, Response
+from httpx2 import Request, Response
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 

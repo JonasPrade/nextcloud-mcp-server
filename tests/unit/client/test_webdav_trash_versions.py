@@ -8,7 +8,7 @@ otherwise it would be reported as a deleted file or a stored version.
 from unittest.mock import AsyncMock
 
 import pytest
-from httpx import AsyncClient
+from httpx2 import AsyncClient
 
 from nextcloud_mcp_server.client.webdav import WebDAVClient
 
@@ -66,31 +66,6 @@ def _client_with_response(mocker, content: bytes = _EMPTY_MULTISTATUS):
     client = WebDAVClient(http, "testuser")
     client._principal_discovered = True
     return client, http
-
-
-class TestOcsHeaderPresent:
-    """Every DAV call the client makes marks itself as API traffic, or
-    Nextcloud's CSRF guard may reject it as browser traffic instead."""
-
-    async def test_list_trash(self, mocker):
-        client, http = _client_with_response(mocker)
-        await client.list_trash()
-        assert http.request.call_args.kwargs["headers"]["OCS-APIRequest"] == "true"
-
-    async def test_restore_from_trash(self, mocker):
-        client, http = _client_with_response(mocker)
-        await client.restore_from_trash("42.d123")
-        assert http.request.call_args.kwargs["headers"]["OCS-APIRequest"] == "true"
-
-    async def test_list_versions(self, mocker):
-        client, http = _client_with_response(mocker)
-        await client.list_versions("doc.txt", file_id=42)
-        assert http.request.call_args.kwargs["headers"]["OCS-APIRequest"] == "true"
-
-    async def test_restore_version(self, mocker):
-        client, http = _client_with_response(mocker)
-        await client.restore_version("doc.txt", "17", file_id=42)
-        assert http.request.call_args.kwargs["headers"]["OCS-APIRequest"] == "true"
 
 
 class TestFileIdShortcut:

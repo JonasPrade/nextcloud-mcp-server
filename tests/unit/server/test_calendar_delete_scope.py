@@ -110,4 +110,4 @@ async def test_manage_calendar_non_destructive_actions_need_only_write(
         ctx=mocker.MagicMock(), action="list"
     )
 
-    assert result == []
+    assert result.calendars == []

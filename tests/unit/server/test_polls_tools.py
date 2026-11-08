@@ -12,7 +12,7 @@ import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
 from mcp.server.mcpserver import MCPServer
 from mcp.shared.exceptions import MCPError
@@ -715,7 +715,7 @@ async def test_close_and_reopen(polls_tools, stub_client, mocker, tool, method):
 
 
 def _http_error(status, message=None):
-    request = httpx.Request("GET", "https://nc.example/ocs/v2.php/apps/polls")
+    request = httpx2.Request("GET", "https://nc.example/ocs/v2.php/apps/polls")
     json = None
     if message is not None:
         json = {
@@ -724,10 +724,10 @@ def _http_error(status, message=None):
                 "data": [],
             }
         }
-    return httpx.HTTPStatusError(
+    return httpx2.HTTPStatusError(
         "boom",
         request=request,
-        response=httpx.Response(status, request=request, json=json),
+        response=httpx2.Response(status, request=request, json=json),
     )
 
 

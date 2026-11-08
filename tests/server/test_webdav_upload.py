@@ -12,7 +12,7 @@ import json
 import os
 import uuid
 
-import httpx
+import httpx2
 import pytest
 from mcp import ClientSession
 
@@ -59,7 +59,7 @@ async def test_upload_ticket_round_trip(
     assert ticket["expires_in"] > 0
     assert ticket["upload_url"] in ticket["curl"]
 
-    async with httpx.AsyncClient(timeout=60) as http:
+    async with httpx2.AsyncClient(timeout=60) as http:
         response = await http.put(ticket["upload_url"], content=body)
         assert response.status_code == 201, response.text
         data = response.json()
@@ -82,7 +82,7 @@ async def test_upload_ticket_round_trip(
     ticket = await _create_upload(
         nc_mcp_client, path, replacement, if_match=data["etag"]
     )
-    async with httpx.AsyncClient(timeout=60) as http:
+    async with httpx2.AsyncClient(timeout=60) as http:
         response = await http.put(ticket["upload_url"], content=replacement)
     assert response.status_code == 200, response.text
     assert response.json()["created"] is False
@@ -98,7 +98,7 @@ async def test_upload_ticket_rejects_wrong_bytes(
     path = f"{upload_dir}/mismatch.bin"
     ticket = await _create_upload(nc_mcp_client, path, body)
 
-    async with httpx.AsyncClient(timeout=30) as http:
+    async with httpx2.AsyncClient(timeout=30) as http:
         # Same length, different bytes: passes the size check, fails the hash.
         response = await http.put(ticket["upload_url"], content=b"differs content!")
     assert response.status_code == 422
@@ -110,7 +110,7 @@ async def test_upload_ticket_rejects_wrong_bytes(
 async def test_upload_ticket_unknown_is_404(nc_mcp_client: ClientSession):
     ticket = await _create_upload(nc_mcp_client, "irrelevant.bin", b"x")
     unknown = ticket["upload_url"].rsplit("/", 1)[0] + "/not-a-ticket"
-    async with httpx.AsyncClient(timeout=30) as http:
+    async with httpx2.AsyncClient(timeout=30) as http:
         response = await http.put(unknown, content=b"x")
     assert response.status_code == 404
     assert response.json()["error"] == "ticket_not_found"
