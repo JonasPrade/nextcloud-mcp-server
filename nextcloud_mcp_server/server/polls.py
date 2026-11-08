@@ -164,6 +164,25 @@ async def _poll_with_options(
     return details["poll"], options, vote_list
 
 
+def _same_slot(
+    options: list[dict[str, Any]], start: int, duration: int
+) -> dict[str, Any] | None:
+    """The option among *options* with this start and length, if any.
+
+    Polls reports both as integer seconds; a malformed value never matches.
+    """
+    for option in options:
+        try:
+            if (
+                int(option.get("timestamp") or 0) == start
+                and int(option.get("duration") or 0) == duration
+            ):
+                return option
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _is_iana_zone(name: Any) -> bool:
     if not isinstance(name, str) or not name:
         return False
@@ -571,7 +590,22 @@ def configure_polls_tools(mcp: MCPServer):
                 if duration < 0:
                     raise ValueError("the slot ends before it starts")
                 length = iso_duration(duration)
-            known = {o.get("id") for o in before if not o.get("deleted")}
+            live = [o for o in before if not o.get("deleted")]
+            # Checked here because Polls does not reliably dedupe: the version
+            # installed in CI (Nextcloud 32-34) stores a second option for the
+            # same start and length instead of answering with the existing one.
+            existing = _same_slot(live, int(begin.timestamp()), duration)
+            if existing is not None:
+                return AddPollOptionsResponse(
+                    poll_id=poll_id,
+                    timezone_name=str(tz),
+                    added=[],
+                    note=(
+                        f"nothing added: the poll already has this slot as option "
+                        f"{existing.get('id')}"
+                    ),
+                )
+            known = {o.get("id") for o in live}
             option = await client.polls.add_option(
                 poll_id, begin.isoformat(timespec="seconds"), length
             )
