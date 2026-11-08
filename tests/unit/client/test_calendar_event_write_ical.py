@@ -10,7 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 
-import httpx
+import httpx2
 import pytest
 from icalendar import Calendar
 
@@ -21,7 +21,7 @@ pytestmark = pytest.mark.unit
 
 def _make_client(mocker) -> CalendarClient:
     client = CalendarClient.__new__(CalendarClient)
-    client._client = mocker.AsyncMock(spec=httpx.AsyncClient)
+    client._client = mocker.AsyncMock(spec=httpx2.AsyncClient)
     client._username = "tester"
     return client
 

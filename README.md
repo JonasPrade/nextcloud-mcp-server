@@ -84,13 +84,13 @@ For Kubernetes, see [cbcoutinho/helm-charts](https://github.com/cbcoutinho/helm-
 | **Notes** | 7 | Full CRUD, keyword search, semantic search |
 | **Calendar** | 20+ | Events (create/update with all-day and ETag protection), todos (tasks), recurring events, attendees, availability. Deleting needs the separate `calendar.delete` scope, deliberately |
 | **Contacts** | 8 | Full CardDAV support, address books |
-| **Files (WebDAV)** | 14 | Filesystem access, OCR/document processing, file comments |
+| **Files (WebDAV)** | 23 | Filesystem access, in-place text edits, OCR/document processing, file comments |
 | **Deck** | 15 | Boards, stacks, cards, labels, assignments |
 | **Cookbook** | 13 | Recipe management, URL import (schema.org) |
 | **Tables** | 5 | Row operations on Nextcloud Tables |
 | **Sharing** | 10+ | Create and manage shares |
 | **News** | 8 | Feeds, folders, items, feed health monitoring |
-| **Mail** | 13 | Accounts, mailboxes, messages, attachments, send; flags (read/unread, star), tags, move, delete |
+| **Mail** | 14 | Accounts, mailboxes, messages, attachments, send, drafts (saved without sending); flags (read/unread, star), tags, move, delete |
 | **Collectives** | 16 | Full CRUD on collectives, pages, and tags |
 | **Talk (spreed)** | 6 | List conversations, read/post messages, mark as read, list participants |
 | **Polls** | 14 | Date and text polls: read options (in the poll's timezone), results with voter names and comments; create and configure polls, add options, vote, comment, confirm, close/reopen |

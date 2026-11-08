@@ -70,7 +70,7 @@ jobs:
       # "pyroscope-io==1.1.0 ... marked as --no-build but has no binary
       # distribution".
       - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
       - name: Build the wheel
@@ -125,9 +125,9 @@ jobs:
           # Version-specific image pins — Renovate updates these via customManagers in renovate.json
           # Each entry is pinned to its major version (e.g., NC 32 only gets 32.x updates)
           - nextcloud_version: "32"
-            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:29335791322254d4b17d8a8ca1a969f9fa13d83b096a2e7891627d094dfb5d58"
+            nextcloud_image: "docker.io/library/nextcloud:32.0.15@sha256:68feaa8992524ac26b4c00194b81c1ae6dc8e9f412ac82de0c5f4d4a2ee4bbcd"
           - nextcloud_version: "33"
-            nextcloud_image: "docker.io/library/nextcloud:33.0.9@sha256:a97666d6ae931bde78a80cfba8abdf46d436d7b540f31895803f6fb0a012d689"
+            nextcloud_image: "docker.io/library/nextcloud:33.0.10@sha256:1a18e5248b836a2f925ce553bd28d7dd69b0205632372f4c506356342182be8e"
           # NOTE: the nc34 lanes are EXPECTED TO FAIL until Astrolabe publishes an
           # NC-34-compatible release to the app store. cbcoutinho/astrolabe#242
           # (max-version="34") is merged but not yet released, so
@@ -139,7 +139,7 @@ jobs:
           # A non-zero result means the release is live and these lanes should go
           # green on a re-run.
           - nextcloud_version: "34"
-            nextcloud_image: "docker.io/library/nextcloud:34.0.4@sha256:37b109885aa3cba3e056362a899556a625c986f2c17cd2c0cc157d21c789f53b"
+            nextcloud_image: "docker.io/library/nextcloud:34.0.5@sha256:b89746a4febc93de82141921417f43b0d5ce69c3746feb485372559e9fbeec3f"
 
           # Mode-specific properties
           - mode: single-user
@@ -233,11 +233,19 @@ jobs:
         if: matrix.mode != 'single-user'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 26
 
-      # Astrolabe is the only app built from its submodule here; oidc is
-      # installed from the app store by app-hooks/post-installation, so it
-      # needs no build step and no mount in docker-compose.yml.
+      # TEMPORARY: oidc is mounted from its submodule (group scope limits are
+      # unreleased). The post-installation hook only uses the mount once it is
+      # built; lanes that skip this step fall back to the app store.
+      - name: Build OIDC app
+        if: matrix.mode != 'single-user'
+        run: |
+          cd third_party/oidc
+          composer install --no-dev --optimize-autoloader
+          npm ci --ignore-scripts
+          npm run build
+
       - name: Build Astrolabe app
         if: matrix.mode != 'single-user'
         run: |
@@ -295,12 +303,19 @@ jobs:
         if: matrix.needs-playwright
         timeout-minutes: 20
         run: |
+          # Wait for the dpkg lock rather than failing on it at once.
+          echo 'DPkg::Lock::Timeout "120";' | sudo tee /etc/apt/apt.conf.d/99-ci-lock-timeout
           for attempt in 1 2 3; do
             if timeout 300 uv run --no-build --no-sync playwright install chromium --with-deps; then
               exit 0
             fi
             echo "::warning::Playwright install attempt ${attempt} failed or stalled; retrying"
+            # `timeout` kills playwright but not the `sudo apt-get` it spawned,
+            # which keeps the dpkg lock and fails every retry with "Could not
+            # get lock". Kill it, then finish any install it interrupted.
+            sudo pkill -x apt-get || true
             sleep 10
+            sudo dpkg --configure -a || true
           done
           echo "::error::Playwright install failed after 3 attempts"
           exit 1

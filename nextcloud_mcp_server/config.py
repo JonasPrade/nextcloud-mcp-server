@@ -15,6 +15,8 @@ from typing import Any
 
 from dynaconf import Dynaconf, Validator
 
+from nextcloud_mcp_server.utils.parsing import parse_bool, split_csv
+
 logger = logging.getLogger(__name__)
 
 # Sentinel for "key not in dynaconf at all" vs "explicitly set to None".
@@ -297,6 +299,11 @@ _DEFAULTS: dict[str, Any] = {
     # Generous headroom over a normal rerank, not a target. Exceeding it
     # degrades to retrieval order rather than failing the search.
     "search_rerank_timeout_seconds": 30.0,
+    # How long a search waits for its query embedding before failing fast with
+    # 503 embedding_unavailable. The provider's own timeout (120 s) and retries
+    # are sized for ingest; a search must answer well inside Astrolabe's 30 s
+    # HTTP timeout, and a healthy query embed takes well under a second.
+    "search_embedding_timeout_seconds": 10.0,
     # Concurrent rerank calls this process keeps in flight against the reranker.
     #
     # Conservative at 1 because reranking is the heaviest request this server
@@ -781,6 +788,7 @@ _dynaconf = Dynaconf(
         Validator("SEARCH_RERANK_POOL_SIZE", gte=1),
         Validator("SEARCH_RERANK_MAX_CONCURRENCY", gte=1),
         Validator("SEARCH_RERANK_TIMEOUT_SECONDS", gt=0),
+        Validator("SEARCH_EMBEDDING_TIMEOUT_SECONDS", gt=0),
         # Non-empty strings
         Validator("VECTOR_SYNC_TAG", len_min=1),
         # VECTOR_SYNC_KEYWORD_TAG is optional (empty disables keyword-only
@@ -940,6 +948,17 @@ LOGGING_CONFIG = {
             "handlers": ["default"],
             "level": "INFO",
         },
+        "httpx2": {
+            "handlers": ["default"],
+            "level": "INFO",
+            "propagate": False,  # Prevent propagation to root logger
+        },
+        "httpcore2": {
+            "handlers": ["default"],
+            "level": "INFO",
+            "propagate": False,  # Prevent propagation to root logger
+        },
+        # Legacy httpx: still used by qdrant-client and huggingface-hub
         "httpx": {
             "handlers": ["default"],
             "level": "INFO",
@@ -1009,9 +1028,7 @@ def get_document_processor_config() -> dict[str, Any]:
             "api_url": _dynaconf.get("UNSTRUCTURED_API_URL"),
             "timeout": _dynaconf.get("UNSTRUCTURED_TIMEOUT"),
             "strategy": _dynaconf.get("UNSTRUCTURED_STRATEGY"),
-            "languages": [
-                lang.strip() for lang in languages_str.split(",") if lang.strip()
-            ],
+            "languages": split_csv(languages_str),
             "progress_interval": _dynaconf.get("PROGRESS_INTERVAL"),
         }
 
@@ -1034,9 +1051,7 @@ def get_document_processor_config() -> dict[str, Any]:
         custom_url = _dynaconf.get("CUSTOM_PROCESSOR_URL")
         if custom_url:
             supported_types_str = _dynaconf.get("CUSTOM_PROCESSOR_TYPES")
-            supported_types = {
-                t.strip() for t in supported_types_str.split(",") if t.strip()
-            }
+            supported_types = set(split_csv(supported_types_str))
 
             config["processors"]["custom"] = {
                 "name": _dynaconf.get("CUSTOM_PROCESSOR_NAME"),
@@ -1059,7 +1074,7 @@ def get_document_processor_config() -> dict[str, Any]:
             config["processors"]["docling"] = {
                 "api_url": docling_url,
                 "timeout": _dynaconf.get("DOCLING_TIMEOUT"),
-                "ocr_lang": [s.strip() for s in lang_str.split(",") if s.strip()],
+                "ocr_lang": split_csv(lang_str),
                 "do_ocr": _dynaconf.get("DOCLING_DO_OCR"),
                 # Normalize like Settings.__post_init__ does (.strip().lower()) so the
                 # image path matches convert_file()'s ``pipeline == "vlm"`` check --
@@ -1155,7 +1170,7 @@ class Settings:
     nextcloud_verify_ssl: bool = True
     nextcloud_ca_bundle: str | None = None
 
-    # Reuse pooled keep-alive connections for the Nextcloud httpx client.
+    # Reuse pooled keep-alive connections for the Nextcloud httpx2 client.
     # Default True preserves low-latency interactive traffic. Set
     # NEXTCLOUD_HTTP_KEEPALIVE=false to force a fresh connection per request
     # (max_keepalive_connections=0) — mirrors the DATABASE_POOL_SIZE→NullPool
@@ -1305,11 +1320,7 @@ class Settings:
             )
 
             return tuple(sorted(get_registry().supported_mime_types()))
-        return tuple(
-            t.strip()
-            for t in self.vector_sync_indexable_mime_types.split(",")
-            if t.strip()
-        )
+        return tuple(split_csv(self.vector_sync_indexable_mime_types))
 
     # Mail tag (an IMAP keyword) restricting which messages are indexed — the
     # mail analogue of ``vector_sync_tag``. Empty (default) indexes every
@@ -1411,6 +1422,7 @@ class Settings:
     search_rerank_model: str = "local/BAAI/bge-reranker-v2-m3"
     search_rerank_pool_size: int = 200
     search_rerank_timeout_seconds: float = 30.0
+    search_embedding_timeout_seconds: float = 10.0
     search_rerank_max_concurrency: int = 1
     # SAR export redaction (ADR-040; see _DEFAULTS for the semantics).
     sar_enabled: bool = False
@@ -1543,7 +1555,7 @@ class Settings:
     # direct mistral backend strips it.
     document_ocr_model: str = "mistral/mistral-ocr-latest"
     # OCR backend HTTP request timeout (seconds). float for parity with the
-    # parse timeout / httpx.Timeout; per-tenant tunable so a gateway with a
+    # parse timeout / httpx2.Timeout; per-tenant tunable so a gateway with a
     # shorter ceiling isn't masked by the 180s default.
     document_ocr_timeout_seconds: float = 180.0
     # OCR execution mode: "sync" | "batch" (Deck #332). batch is opt-in and routes
@@ -1873,7 +1885,7 @@ class Settings:
         self.ner_batch_size = int(self.ner_batch_size)
         if self.ner_batch_size < 1:
             raise ValueError(f"NER_BATCH_SIZE must be >= 1; got {self.ner_batch_size}")
-        # 0 would give httpx no time budget: every NER call would time out at
+        # 0 would give httpx2 no time budget: every NER call would time out at
         # request time instead of failing here with a clear message.
         self.ner_timeout_seconds = float(self.ner_timeout_seconds)
         if self.ner_timeout_seconds <= 0:
@@ -2384,13 +2396,11 @@ def cfg_bool(key: str, default: bool = False) -> bool:
     syntax, which only recognises lowercase ``true``/``false``, so
     ``SOME_FLAG=False`` survives as the *string* ``"False"`` — and
     ``bool("False")`` is ``True``, inverting the operator's intent. This accepts
-    the spellings a human plausibly types (``true``/``1``/``yes``/``on``, any
-    case) and treats everything else as false.
+    the spellings a human plausibly types (``true``/``1``/``yes``/``on`` and
+    ``false``/``0``/``no``/``off``, any case). An unrecognised value yields
+    *default* and logs a warning naming *key* (see ``parse_bool``).
     """
-    value = cfg(key, default)
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    return parse_bool(cfg(key, default), default, name=key)
 
 
 def set_override(key: str, value) -> None:
@@ -2503,7 +2513,7 @@ def get_nextcloud_ssl_verify() -> bool | ssl.SSLContext:
 
 @functools.cache
 def get_nextcloud_http_keepalive() -> bool:
-    """Return whether the Nextcloud httpx client may reuse pooled connections.
+    """Return whether the Nextcloud httpx2 client may reuse pooled connections.
 
     Returns:
         - False if NEXTCLOUD_HTTP_KEEPALIVE=false (fresh connection per
