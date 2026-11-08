@@ -2,6 +2,7 @@ import base64
 import contextlib
 import logging
 import posixpath
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional
 
 import anyio
@@ -26,6 +27,7 @@ from nextcloud_mcp_server.links import file_url, with_links
 from nextcloud_mcp_server.models import (
     CopyResourceResponse,
     CreateFileCommentResponse,
+    CreateUploadResponse,
     DirectoryListing,
     FileComment,
     FileInfo,
@@ -57,6 +59,16 @@ from nextcloud_mcp_server.server.tag_exclusion import (
     is_path_excluded,
 )
 from nextcloud_mcp_server.server.webdav_image import configure_webdav_image_tools
+from nextcloud_mcp_server.server.webdav_upload import (
+    UPLOAD_ROUTE_PREFIX,
+    TicketLimitError,
+    get_upload_ticket_store,
+    normalize_sha256,
+    upload_base_url,
+    upload_max_bytes,
+    upload_ticket_ttl_seconds,
+    validate_upload_path,
+)
 from nextcloud_mcp_server.utils.message_splitter import (
     COMMENT_MAX_LENGTH,
     is_blank_comment,
@@ -413,6 +425,47 @@ async def _resolve_file_id(client: "NextcloudClient", path: str) -> int:
         raise ToolError(
             f"Unexpected non-numeric file id {file_id!r} for {path!r}"
         ) from None
+
+
+async def _preflight_upload_target(
+    client: "NextcloudClient", path: str, if_match: str | None
+) -> None:
+    """Refuse an upload ticket that is certain to fail at PUT time.
+
+    Saves the caller a pointless transfer: a missing parent folder, or an
+    ``if_match`` that contradicts whether the file exists, would otherwise only
+    surface after the whole body was sent. Advisory only -- the conditional PUT
+    remains the authoritative check (the state can change within the ticket's
+    lifetime), so a lookup that errors is logged and skipped, not raised.
+    """
+    stripped = path.strip("/")
+    parent = stripped.rsplit("/", 1)[0] if "/" in stripped else ""
+    try:
+        if parent and await client.webdav.get_fileid(parent) is None:
+            raise ToolError(
+                f"Target folder {parent!r} does not exist; create it with "
+                "nc_webdav_create_directory first"
+            )
+        if if_match is None or if_match == "*":
+            exists = await client.webdav.get_fileid(path) is not None
+            if if_match is None and exists:
+                raise ToolError(
+                    f"{path!r} already exists. Read it with nc_webdav_read_file "
+                    "and pass its etag as if_match to replace it, or pass "
+                    "if_match='*' to overwrite deliberately"
+                )
+            if if_match == "*" and not exists:
+                raise ToolError(f"{path!r} does not exist; omit if_match to create it")
+    except ToolError:
+        raise
+    except Exception:
+        # Fail-open: the conditional PUT is the authoritative check, so a lookup
+        # that errors costs the caller the early refusal, never the ticket.
+        logger.warning(
+            "Upload preflight for %r failed, issuing the ticket anyway",
+            path,
+            exc_info=True,
+        )
 
 
 def configure_webdav_tools(mcp: MCPServer):
@@ -1189,6 +1242,127 @@ def configure_webdav_tools(mcp: MCPServer):
             size=len(updated),
             diff=diff,
             diff_truncated=diff_truncated,
+        )
+
+    @mcp.tool(
+        title="Create Upload Link",
+        annotations=ToolAnnotations(
+            # Not idempotent: every call issues a fresh single-use ticket. The
+            # call itself writes nothing to Nextcloud; the later PUT does, with
+            # the same fail-closed precondition semantics as write_file.
+            idempotent_hint=False,
+            open_world_hint=True,
+        ),
+    )
+    @require_scopes("files.write")
+    @instrument_tool
+    async def nc_webdav_create_upload(
+        path: str,
+        size: int,
+        sha256: str,
+        ctx: Context,
+        if_match: str | None = None,
+        content_type: str | None = None,
+    ) -> CreateUploadResponse:
+        """Get a one-time upload URL to put a file into Nextcloud WITHOUT base64.
+
+        Use this instead of ``nc_webdav_write_file`` for binary files (PDF, Word,
+        Excel, images, ...) and anything larger than a few KB that exists as a
+        file in your sandbox. Then send the file yourself by running the
+        returned ``curl`` command with the placeholder ``<file>`` replaced by
+        the local file path. It is a plain HTTP PUT of the raw bytes:
+        ``curl --fail-with-body -sS -X PUT --data-binary @FILE "UPLOAD_URL"``.
+
+        The server checks size and SHA-256 and writes the file with your
+        Nextcloud credentials. The PUT answers JSON. On success it carries
+        ``path``, ``size``, ``etag``, ``created`` and ``url`` (link to open the
+        file in Nextcloud). On failure it carries ``error`` and ``reason`` with
+        status 404 (unknown ticket), 410 (expired or already used), 413 (too
+        large), 422 (size or hash mismatch), 403 (excluded tag), 409 (target
+        folder missing), 412 (``if_match`` precondition failed) or 423 (locked).
+
+        The URL is valid for ``expires_in`` seconds (10 minutes by default) and
+        for exactly ONE attempt. Even a failed attempt uses it up, so request a
+        new ticket after any error. It is bound to exactly this ``path``,
+        ``size``, ``sha256`` and ``if_match``.
+
+        Args:
+            path: Target path in Nextcloud, e.g. ``Vorstand/Urkunde.pdf``. The
+                parent folder must exist (``nc_webdav_create_directory``).
+            size: Exact file size in bytes (e.g. ``stat -c %s FILE``).
+            sha256: Hex SHA-256 of the file (e.g. ``sha256sum FILE``).
+            if_match: Same semantics as ``nc_webdav_write_file``. Omit it to
+                create a new file only (fails if the path exists). Pass an etag
+                to replace the file only if it is unchanged. Pass ``"*"`` to
+                force-overwrite an existing file.
+            content_type: MIME type, derived from the file extension if omitted.
+
+        Returns:
+            ``CreateUploadResponse`` with ``upload_url``, ``curl``,
+            ``expires_in`` (seconds), ``expires_at`` and ``path``.
+        """
+        request = getattr(ctx.request_context, "request", None)
+        if request is None:
+            raise ToolError(
+                "Upload links need the server's HTTP transport; this session has "
+                "no HTTP endpoint to upload to. Use nc_webdav_write_file instead."
+            )
+        base_url = upload_base_url(request)
+        if not base_url:
+            raise ToolError(
+                "Cannot build an upload URL: set WEBDAV_UPLOAD_BASE_URL to the "
+                "server's externally reachable URL."
+            )
+
+        reason = validate_upload_path(path)
+        if reason:
+            raise ToolError(f"Invalid path {path!r}: {reason}")
+        digest = normalize_sha256(sha256)
+        if digest is None:
+            raise ToolError("sha256 must be the 64-character hex SHA-256 of the file")
+        if size < 0:
+            raise ToolError("size must be the file size in bytes (>= 0)")
+        max_bytes = upload_max_bytes()
+        if max_bytes is not None and size > max_bytes:
+            raise ToolError(
+                f"Refusing to accept {path!r}: {size} bytes exceeds the configured "
+                f"WEBDAV_UPLOAD_MAX_MB ({get_settings().webdav_upload_max_mb} MB)."
+            )
+
+        client = await get_client(ctx)
+
+        excluded = await get_excluded_file_paths(client.webdav)
+        if is_path_excluded(path, excluded):
+            raise ToolError(f"Access denied: {path!r} is tagged with an excluded tag")
+
+        await _preflight_upload_target(client, path, if_match)
+
+        ttl = upload_ticket_ttl_seconds()
+        try:
+            token, ticket = get_upload_ticket_store().issue(
+                client=client,
+                path=path,
+                size=size,
+                sha256=digest,
+                if_match=if_match,
+                content_type=content_type,
+                ttl_seconds=ttl,
+            )
+        except TicketLimitError as e:
+            raise ToolError(str(e)) from e
+
+        upload_url = f"{base_url}{UPLOAD_ROUTE_PREFIX}{token}"
+        logger.info(
+            "Issued upload ticket for %r (%d bytes) to %s", path, size, ticket.user
+        )
+        return CreateUploadResponse(
+            path=path,
+            upload_url=upload_url,
+            curl=(
+                f'curl --fail-with-body -sS -X PUT --data-binary @<file> "{upload_url}"'
+            ),
+            expires_in=ttl,
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl),
         )
 
     @mcp.tool(

@@ -202,6 +202,19 @@ async def test_webdav_write_is_not_idempotent(nc_mcp_client: ClientSession):
     )
 
 
+async def test_webdav_create_upload_annotations(nc_mcp_client: ClientSession):
+    """nc_webdav_create_upload issues a fresh single-use ticket per call, so it
+    is neither read-only nor idempotent, and it reaches Nextcloud."""
+    tools = await nc_mcp_client.list_tools()
+
+    tool = next((t for t in tools.tools if t.name == "nc_webdav_create_upload"), None)
+    assert tool is not None, "nc_webdav_create_upload tool not found"
+    assert tool.annotations is not None
+    assert tool.annotations.read_only_hint is not True
+    assert tool.annotations.idempotent_hint is not True
+    assert tool.annotations.open_world_hint is True
+
+
 async def test_semantic_search_open_world(nc_mcp_client: ClientSession):
     """Verify semantic search has open_world_hint=True (ADR-017 decision).
 

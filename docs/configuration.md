@@ -1692,6 +1692,7 @@ tag names to file paths and applies the following:
 | `nc_webdav_list_directory` | Excluded files/folders are omitted from listings |
 | `nc_webdav_read_file` | Raises `ToolError` (access denied) |
 | `nc_webdav_write_file` | Raises `ToolError` (access denied) |
+| `nc_webdav_create_upload` | Raises `ToolError` (access denied); the upload PUT re-checks and answers 403 |
 | `nc_webdav_create_directory` | Blocked inside excluded paths |
 | `nc_webdav_delete_resource` | Raises `ToolError` (access denied) |
 | `nc_webdav_move_resource` | Blocked when source **or** destination is excluded |
@@ -1819,6 +1820,12 @@ the server, not the proxy's public address. Examples:
 This affects more than log readability: rate limiting on OAuth dynamic client
 registration is keyed on the client address, so while the real address is unknown
 every client behind the proxy shares a single bucket.
+
+Upload links from `nc_webdav_create_upload` are built from
+`WEBDAV_UPLOAD_BASE_URL`, then `NEXTCLOUD_MCP_SERVER_URL`, then the request's
+own base URL. Behind a proxy set one of the first two to the public URL, and let
+the proxy accept bodies up to `WEBDAV_UPLOAD_MAX_MB` on `/upload/` (see
+[WebDAV upload tickets](webdav.md#upload-tickets-for-binary-files)).
 
 ### Prefer a CIDR over `*`
 

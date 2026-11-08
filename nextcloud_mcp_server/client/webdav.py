@@ -10,7 +10,7 @@ from urllib.parse import quote, unquote
 from xml.sax.saxutils import escape as xml_escape
 
 import anyio
-from httpx2 import HTTPStatusError, RemoteProtocolError, Response
+from httpx2 import HTTPStatusError, RemoteProtocolError, Response, Timeout
 
 from nextcloud_mcp_server.observability.metrics import (
     document_download_truncated_total,
@@ -978,6 +978,8 @@ class WebDAVClient(BaseNextcloudClient):
         content: bytes,
         content_type: Optional[str] = None,
         if_match: Optional[str] = None,
+        *,
+        timeout: float | None = None,
     ) -> Dict[str, Any]:
         """Write content to a file via WebDAV PUT.
 
@@ -1003,6 +1005,9 @@ class WebDAVClient(BaseNextcloudClient):
             if_match: ``None`` to create a new file (fails if it exists); an
                 etag from :meth:`read_file` to overwrite only if unchanged; or
                 the literal ``"*"`` to force-overwrite an existing file.
+            timeout: Overall request timeout in seconds for this PUT. ``None``
+                keeps the client's default (30 s), which is too short for a
+                multi-megabyte upload over a slow Nextcloud link.
 
         Returns:
             ``{"status_code": ...}`` on success. On a 412 (a precondition above
@@ -1029,9 +1034,13 @@ class WebDAVClient(BaseNextcloudClient):
         # atomically before the PUT, so this is race-free.
         headers.update(_write_precondition_header(if_match))
 
+        extra: Dict[str, Any] = {}
+        if timeout is not None:
+            extra["timeout"] = Timeout(timeout, connect=5)
+
         try:
             response = await self._make_request(
-                "PUT", webdav_path, content=content, headers=headers
+                "PUT", webdav_path, content=content, headers=headers, **extra
             )
             response.raise_for_status()
 

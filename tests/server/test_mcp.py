@@ -39,6 +39,7 @@ async def test_mcp_connectivity(nc_mcp_client: ClientSession):
         "nc_webdav_list_directory",
         "nc_webdav_read_file",
         "nc_webdav_write_file",
+        "nc_webdav_create_upload",
         "nc_webdav_create_directory",
         "nc_webdav_delete_resource",
         "nc_webdav_move_resource",

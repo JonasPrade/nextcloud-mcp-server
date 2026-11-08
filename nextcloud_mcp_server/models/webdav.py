@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 from .base import BaseResponse, StatusResponse
 
@@ -227,6 +227,30 @@ class EditFileResponse(BaseResponse):
         False,
         description="Whether the diff was cut short. The edit itself is complete.",
     )
+
+
+class CreateUploadResponse(BaseResponse):
+    """Response model for issuing a one-time upload ticket."""
+
+    path: str = Field(description="Nextcloud path the uploaded file will be written to")
+    upload_url: str = Field(
+        description=(
+            "One-time URL to PUT the file's raw bytes to. Valid for exactly one "
+            "attempt; any attempt, successful or not, uses it up."
+        )
+    )
+    curl: str = Field(
+        description=(
+            "Ready-to-run command that sends the file. Replace `<file>` with the "
+            "local path of the file whose size and SHA-256 were declared."
+        )
+    )
+    expires_in: int = Field(description="Seconds until the upload URL expires")
+    expires_at: datetime = Field(description="When the upload URL expires (UTC)")
+
+    @field_serializer("expires_at")
+    def serialize_expires_at(self, value: datetime) -> str:
+        return value.isoformat().replace("+00:00", "Z")
 
 
 class CreateDirectoryResponse(StatusResponse):
