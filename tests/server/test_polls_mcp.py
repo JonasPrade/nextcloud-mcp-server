@@ -24,7 +24,7 @@ API = "/ocs/v2.php/apps/polls/api/v1.0"
 
 # Two one-hour slots, far enough in the future that Polls never treats them as
 # past. 2030-03-04 10:00 UTC and 2030-03-05 10:00 UTC.
-SLOT_A = 1899194400
+SLOT_A = 1898848800
 SLOT_B = SLOT_A + 86400
 
 
