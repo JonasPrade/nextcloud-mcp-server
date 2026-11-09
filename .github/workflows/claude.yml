@@ -17,7 +17,10 @@ jobs:
     # GitHub user could drive it from a comment. Each clause checks the
     # author_association of the entity that carries the mention: on an
     # issue_comment the *commenter* is what matters, not the issue's author.
+    # Fork guard: needs CLAUDE_CODE_OAUTH_TOKEN, which this fork does not
+    # set (changes are reviewed and tested before they become a PR).
     if: |
+      github.repository == 'cbcoutinho/nextcloud-mcp-server' && (
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') &&
@@ -25,7 +28,7 @@ jobs:
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)))
     runs-on: ubuntu-latest
     permissions:
       contents: read
