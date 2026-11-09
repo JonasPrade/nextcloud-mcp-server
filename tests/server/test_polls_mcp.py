@@ -24,7 +24,7 @@ API = "/ocs/v2.php/apps/polls/api/v1.0"
 
 # Two one-hour slots, far enough in the future that Polls never treats them as
 # past. 2030-03-04 10:00 UTC and 2030-03-05 10:00 UTC.
-SLOT_A = 1899194400
+SLOT_A = 1898848800
 SLOT_B = SLOT_A + 86400
 
 
@@ -197,7 +197,8 @@ async def test_mcp_polls_write_round_trip(
         # local offset in the text, as its web UI does (not UTC).
         assert by_id[first_id]["text"].startswith("2030-03-04T11:00:00+01:00")
 
-        # The same slot again: Polls hands back the existing option.
+        # The same slot again: the tool finds it among the existing options
+        # and adds nothing. Polls itself stores a second option for it.
         duplicate = _payload(
             await nc_mcp_client.call_tool(
                 "nc_polls_add_date_option",

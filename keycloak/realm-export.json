@@ -406,6 +406,7 @@
         "notes.write",
         "calendar.read",
         "calendar.write",
+        "calendar.delete",
         "contacts.read",
         "contacts.write",
         "cookbook.read",
@@ -628,7 +629,17 @@
       "attributes": {
         "include.in.token.scope": "true",
         "display.on.consent.screen": "true",
-        "consent.screen.text": "Create, update, and delete calendars and events"
+        "consent.screen.text": "Create and update calendars and events"
+      }
+    },
+    {
+      "name": "calendar.delete",
+      "description": "Nextcloud Calendar delete access",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Delete calendars and events"
       }
     },
     {
@@ -853,6 +864,7 @@
     "notes.write",
     "calendar.read",
     "calendar.write",
+    "calendar.delete",
     "contacts.read",
     "contacts.write",
     "cookbook.read",

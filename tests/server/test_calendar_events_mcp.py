@@ -10,6 +10,10 @@ from mcp import ClientSession
 from nextcloud_mcp_server.client import NextcloudClient
 
 logger = logging.getLogger(__name__)
+
+# CALENDAR_DEFAULT_TIMEZONE's default. docker-compose leaves it unset for the
+# mcp service, so a naive time with no user timezone is bound to this zone.
+SERVER_DEFAULT_TIMEZONE = "Europe/Berlin"
 pytestmark = pytest.mark.integration
 
 
@@ -429,7 +433,9 @@ async def test_mcp_create_meeting_binds_a_timezone(
 
     An explicit ``timezone`` must produce a TZID-bound event; without one the
     tool falls back to the user's Nextcloud timezone, read from the real OCS
-    ``/cloud/user`` endpoint, and only stays floating if that is unset.
+    ``/cloud/user`` endpoint. If that is unset, the server's
+    ``CALENDAR_DEFAULT_TIMEZONE`` applies (default ``Europe/Berlin``, which the
+    test stack does not override), so the event is still not floating.
     """
     date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     user_tz = await nc_client.users.get_current_user_timezone()
@@ -438,7 +444,7 @@ async def test_mcp_create_meeting_binds_a_timezone(
     try:
         for args, expected_tz in [
             ({"timezone": "America/New_York"}, "America/New_York"),
-            ({}, user_tz or None),
+            ({}, user_tz or SERVER_DEFAULT_TIMEZONE),
         ]:
             result = await nc_mcp_client.call_tool(
                 "nc_calendar_create_meeting",

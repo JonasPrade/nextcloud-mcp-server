@@ -19,7 +19,9 @@ jobs:
     # gate every contributor PR carried a failing `claude-review` check.
     # Skipping the job outright leaves no check at all, which is the intent --
     # do not "fix" that red check by removing this condition.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # Fork guard: needs CLAUDE_CODE_OAUTH_TOKEN, which this fork does not
+    # set (changes are reviewed and tested before they become a PR).
+    if: github.repository == 'cbcoutinho/nextcloud-mcp-server' && github.event.pull_request.head.repo.full_name == github.repository
 
     runs-on: ubuntu-latest
     permissions:

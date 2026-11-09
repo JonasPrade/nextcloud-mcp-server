@@ -16,6 +16,9 @@ jobs:
   # when bump-version.yml drives the release, and from the ref when a tag is
   # pushed by hand.
   resolve-tag:
+    # Fork guard: publishes to the original author's PyPI package and GHCR
+    # image. Must never run from a fork; dependent jobs skip with it.
+    if: github.repository == 'cbcoutinho/nextcloud-mcp-server'
     runs-on: ubuntu-latest
     # Branches on a string and never touches the token; scope it down explicitly
     # like the two jobs below rather than inheriting the caller's grant.

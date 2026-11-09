@@ -21,6 +21,12 @@ from nextcloud_mcp_server.client import NextcloudClient
 logger = logging.getLogger(__name__)
 pytestmark = pytest.mark.integration
 
+# Pin one zone for both the probe event and the query. A naive time is stored
+# in CALENDAR_DEFAULT_TIMEZONE (Europe/Berlin), while availability without a
+# ``timezone`` is computed in the server's local offset (UTC in the container),
+# which shifted the booked hour by one and shortened the morning slot.
+TZ = "Europe/Berlin"
+
 
 def _quiet_monday() -> date:
     """A Monday far enough out that no other test has booked anything on it."""
@@ -50,6 +56,7 @@ async def test_find_availability_reflects_real_events(
                 "title": "Availability probe meeting",
                 "start_datetime": f"{day.isoformat()}T11:00:00",
                 "end_datetime": f"{day.isoformat()}T12:00:00",
+                "timezone": TZ,
             },
         )
         created.append(meeting["uid"])
@@ -70,6 +77,7 @@ async def test_find_availability_reflects_real_events(
             duration_minutes=60,
             date_range_start=day.isoformat(),
             date_range_end=day.isoformat(),
+            timezone=TZ,
         )
 
         assert data["success"] is True
@@ -95,6 +103,7 @@ async def test_find_availability_reflects_real_events(
             date_range_start=day.isoformat(),
             date_range_end=day.isoformat(),
             include_all_day=True,
+            timezone=TZ,
         )
         assert with_all_day["available_slots"] == []
 

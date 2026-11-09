@@ -438,10 +438,66 @@ async def test_add_date_option_reports_the_stored_slot(
     assert result.added[0].end.isoformat() == "2026-10-20T19:30:00+02:00"
 
 
-async def test_add_date_option_existing_slot_is_not_reported_as_added(
+async def test_add_date_option_existing_slot_is_not_sent_again(
     polls_tools, stub_client, mocker
 ):
-    """Polls answers 201 with the existing option for a duplicate slot."""
+    """A slot the poll already has is caught before Polls is asked.
+
+    Polls does not reliably dedupe: the version in CI stores a second option
+    for the same start and length.
+    """
+    stub_client.polls.add_option = mocker.AsyncMock()
+
+    # Option 1 is SLOT_SUMMER (18:00 CEST) for 7200 s, given here once naive in
+    # the poll's zone and once as the same instant in UTC.
+    for start in ("2026-10-20T18:00", "2026-10-20T16:00:00+00:00"):
+        result = await _call(
+            polls_tools,
+            mocker,
+            "nc_polls_add_date_option",
+            poll_id=7,
+            start=start,
+            duration_minutes=120,
+        )
+        assert result.added == []
+        assert "already has this slot as option 1" in result.note
+
+    stub_client.polls.add_option.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        # Same start as option 1, other length.
+        {"start": "2026-10-20T18:00", "duration_minutes": 60},
+        # Same start and length as option 3, which is deleted.
+        {"start": "2026-10-28T18:00", "duration_minutes": 120},
+    ],
+)
+async def test_add_date_option_other_or_deleted_slot_is_sent(
+    polls_tools, stub_client, mocker, kwargs
+):
+    """Only a live option with the same start and length counts as a duplicate."""
+    stub_client.polls.add_option = mocker.AsyncMock(
+        return_value=_option(9, SLOT_SUMMER, 9, duration=3600)
+    )
+
+    result = await _call(
+        polls_tools, mocker, "nc_polls_add_date_option", poll_id=7, **kwargs
+    )
+
+    stub_client.polls.add_option.assert_awaited_once()
+    assert [o.id for o in result.added] == [9]
+
+
+async def test_add_date_option_polls_answering_with_existing_is_not_added(
+    polls_tools, stub_client, mocker
+):
+    """If Polls answers 201 with an option it already had, nothing was added.
+
+    The fallback for a Polls version that dedupes on a key the tool does not
+    compare.
+    """
     stub_client.polls.add_option = mocker.AsyncMock(
         return_value=_option(1, SLOT_SUMMER, 1)
     )
@@ -451,10 +507,11 @@ async def test_add_date_option_existing_slot_is_not_reported_as_added(
         mocker,
         "nc_polls_add_date_option",
         poll_id=7,
-        start="2026-10-20T18:00",
+        start="2026-10-23T18:00",
         duration_minutes=120,
     )
 
+    stub_client.polls.add_option.assert_awaited_once()
     assert result.added == []
     assert "already has this slot as option 1" in result.note
 

@@ -16,6 +16,9 @@ env:
 
 jobs:
   resolve-tag:
+    # Fork guard: publishes to the original author's PyPI package and GHCR
+    # image. Must never run from a fork; dependent jobs skip with it.
+    if: github.repository == 'cbcoutinho/nextcloud-mcp-server'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
